@@ -52,8 +52,8 @@ jobs:
         run: terraform validate
 
       - name: Terraform Plan
-        working-directory: terraform
         run: |
+          cd terraform
           terraform plan \
             -var-file=environments/dev/terraform.tfvars \
             -out=tfplan
