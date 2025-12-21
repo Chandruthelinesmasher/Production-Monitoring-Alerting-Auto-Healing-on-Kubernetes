@@ -1,5 +1,20 @@
 # terraform/providers.tf
 
+terraform {
+  required_version = ">= 1.6.0"
+
+  required_providers {
+    azurerm = {
+      source  = "hashicorp/azurerm"
+      version = "~> 3.85.0"
+    }
+    random = {
+      source  = "hashicorp/random"
+      version = "~> 3.6.0"
+    }
+  }
+}
+
 # Azure Provider
 provider "azurerm" {
   features {
@@ -7,10 +22,7 @@ provider "azurerm" {
       prevent_deletion_if_contains_resources = false
     }
   }
-
-  skip_provider_registration = true
 }
 
 # Get current Azure client configuration
 data "azurerm_client_config" "current" {}
-

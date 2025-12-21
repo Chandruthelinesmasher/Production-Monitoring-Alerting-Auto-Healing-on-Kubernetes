@@ -6,15 +6,20 @@ resource "azurerm_kubernetes_cluster" "main" {
   kubernetes_version  = var.kubernetes_version
 
   default_node_pool {
-    name                = var.default_node_pool.name
-    node_count          = var.default_node_pool.node_count
-    vm_size             = var.default_node_pool.vm_size
-    zones               = var.default_node_pool.availability_zones
+    name       = var.default_node_pool.name
+    node_count = var.default_node_pool.enable_auto_scaling ? null : var.default_node_pool.node_count
+    vm_size    = var.default_node_pool.vm_size
+    zones      = var.default_node_pool.availability_zones
+
+    # Auto-scaling configuration
     enable_auto_scaling = var.default_node_pool.enable_auto_scaling
     min_count           = var.default_node_pool.enable_auto_scaling ? var.default_node_pool.min_count : null
     max_count           = var.default_node_pool.enable_auto_scaling ? var.default_node_pool.max_count : null
-    os_disk_size_gb     = 30
-    type                = "VirtualMachineScaleSets"
+
+    # Additional settings
+    os_disk_size_gb       = 30
+    type                  = "VirtualMachineScaleSets"
+    enable_node_public_ip = false
   }
 
   identity {
