@@ -70,6 +70,26 @@ jobs:
           
           echo "Required resource providers registered successfully"
 
+      - name: Clean Up Orphaned Resources (Dev Only)
+        if: github.ref == 'refs/heads/main'
+        run: |
+          echo "Checking for orphaned resources..."
+          # Check if resource group exists but not in Terraform state
+          if az group show --name ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            echo "Found existing resource group. Checking Terraform state..."
+            cd terraform
+            if ! terraform state list | grep -q "azurerm_resource_group"; then
+              echo "Resource group exists but not in Terraform state. Cleaning up..."
+              az group delete --name ${{ env.RESOURCE_GROUP }} --yes --no-wait
+              echo "Waiting 60 seconds for deletion to complete..."
+              sleep 60
+            else
+              echo "Resource group is in Terraform state. Proceeding normally."
+            fi
+          else
+            echo "No orphaned resources found."
+          fi
+
       - name: Debug - Check Directory Structure
         run: |
           pwd
@@ -101,6 +121,14 @@ jobs:
             -var="aks_dns_prefix=aks-sre-dev" \
             -var="kubernetes_version=1.28" \
             -out=tfplan
+
+      - name: Clean Up Existing Resources (if plan fails)
+        if: failure()
+        run: |
+          echo "Cleaning up any existing resources..."
+          az group delete --name ${{ env.RESOURCE_GROUP }} --yes --no-wait || true
+          echo "Waiting for resource group deletion..."
+          sleep 30
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
