@@ -70,47 +70,39 @@ jobs:
           
           echo "Required resource providers registered successfully"
 
-      - name: Clean Up Orphaned Resources (Dev Only)
-        if: github.ref == 'refs/heads/main'
+      - name: Get Available Kubernetes Versions
         run: |
-          echo "Checking for orphaned resources..."
-          # Check if resource group exists but not in Terraform state
-          if az group show --name ${{ env.RESOURCE_GROUP }} &>/dev/null; then
-            echo "Found existing resource group. Checking Terraform state..."
-            cd terraform
-            if ! terraform state list | grep -q "azurerm_resource_group"; then
-              echo "Resource group exists but not in Terraform state. Cleaning up..."
-              az group delete --name ${{ env.RESOURCE_GROUP }} --yes --no-wait
-              echo "Waiting 60 seconds for deletion to complete..."
-              sleep 60
-            else
-              echo "Resource group is in Terraform state. Proceeding normally."
-            fi
-          else
-            echo "No orphaned resources found."
-          fi
-
-      - name: Debug - Check Directory Structure
-        run: |
-          pwd
-          echo "=== Root directory ==="
-          ls -la
+          echo "Getting available Kubernetes versions for ${{ env.LOCATION }}..."
+          az aks get-versions --location ${{ env.LOCATION }} --output table
           echo ""
-          echo "=== Terraform directory ==="
-          ls -la terraform/
-          echo ""
-          echo "=== Check if environments exists ==="
-          ls -la terraform/environments/ || echo "environments directory not found"
-          echo ""
-          echo "=== Check if dev exists ==="
-          ls -la terraform/environments/dev/ || echo "dev directory not found"
-          echo ""
-          echo "=== Find all tfvars files ==="
-          find . -name "*.tfvars" -type f
+          echo "Available non-preview versions:"
+          az aks get-versions --location ${{ env.LOCATION }} --query "values[?isPreview==null].version" -o tsv
 
       - name: Terraform Plan
         run: |
           cd terraform
+          
+          # Get all available non-preview versions
+          echo "Fetching available Kubernetes versions..."
+          VERSIONS=$(az aks get-versions --location ${{ env.LOCATION }} --query "values[?isPreview==null].version" -o tsv)
+          echo "Available versions: $VERSIONS"
+          
+          # Try 1.31 first (most likely to be non-LTS)
+          if echo "$VERSIONS" | grep -q "^1\.31"; then
+            K8S_VERSION="1.31"
+          # Fallback to 1.32 if available
+          elif echo "$VERSIONS" | grep -q "^1\.32"; then
+            K8S_VERSION="1.32"
+          # Fallback to any version that starts with 1.3
+          elif echo "$VERSIONS" | grep -q "^1\.3"; then
+            K8S_VERSION=$(echo "$VERSIONS" | grep "^1\.3" | head -n1 | cut -d'.' -f1,2)
+          # Use first available version as last resort
+          else
+            K8S_VERSION=$(echo "$VERSIONS" | head -n1 | cut -d'.' -f1,2)
+          fi
+          
+          echo "Selected Kubernetes version: $K8S_VERSION"
+          
           terraform plan \
             -var="location=${{ env.LOCATION }}" \
             -var="environment=dev" \
@@ -119,16 +111,8 @@ jobs:
             -var="acr_sku=Basic" \
             -var="aks_cluster_name=aks-sre-monitoring-dev" \
             -var="aks_dns_prefix=aks-sre-dev" \
-            -var="kubernetes_version=1.30" \
+            -var="kubernetes_version=$K8S_VERSION" \
             -out=tfplan
-
-      - name: Clean Up Existing Resources (if plan fails)
-        if: failure()
-        run: |
-          echo "Cleaning up any existing resources..."
-          az group delete --name ${{ env.RESOURCE_GROUP }} --yes --no-wait || true
-          echo "Waiting for resource group deletion..."
-          sleep 30
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
