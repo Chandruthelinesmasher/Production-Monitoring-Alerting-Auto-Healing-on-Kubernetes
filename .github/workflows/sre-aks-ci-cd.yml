@@ -53,6 +53,23 @@ jobs:
           cd terraform
           terraform validate
 
+      - name: Register Required Azure Resource Providers
+        run: |
+          echo "Registering only the required Azure Resource Providers..."
+          
+          # Register only the providers we actually need for AKS and ACR
+          az provider register --namespace Microsoft.ContainerService
+          az provider register --namespace Microsoft.ContainerRegistry
+          az provider register --namespace Microsoft.Network
+          az provider register --namespace Microsoft.Compute
+          az provider register --namespace Microsoft.Storage
+          
+          echo "Waiting for provider registration to complete..."
+          az provider show --namespace Microsoft.ContainerService --query "registrationState" -o tsv
+          az provider show --namespace Microsoft.ContainerRegistry --query "registrationState" -o tsv
+          
+          echo "Required resource providers registered successfully"
+
       - name: Debug - Check Directory Structure
         run: |
           pwd

@@ -22,6 +22,10 @@ provider "azurerm" {
       prevent_deletion_if_contains_resources = false
     }
   }
+  
+  # Skip automatic provider registration to avoid permission issues
+  # We only register the providers we actually need in the workflow
+  skip_provider_registration = true
 }
 
 # Get current Azure client configuration
