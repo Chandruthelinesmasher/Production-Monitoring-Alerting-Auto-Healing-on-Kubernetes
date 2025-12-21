@@ -119,7 +119,7 @@ jobs:
             -var="acr_sku=Basic" \
             -var="aks_cluster_name=aks-sre-monitoring-dev" \
             -var="aks_dns_prefix=aks-sre-dev" \
-            -var="kubernetes_version=1.29" \
+            -var="kubernetes_version=1.30" \
             -out=tfplan
 
       - name: Clean Up Existing Resources (if plan fails)
