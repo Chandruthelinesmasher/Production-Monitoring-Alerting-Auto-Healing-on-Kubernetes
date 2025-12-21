@@ -1,0 +1,15 @@
+{
+  "name": "k8s-sre-monitoring-app",
+  "version": "1.0.0",
+  "description": "SRE demo app for Kubernetes monitoring, alerting, and auto-healing",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.19.2",
+    "prom-client": "^15.1.3",
+    "winston": "^3.13.0"
+  }
+}

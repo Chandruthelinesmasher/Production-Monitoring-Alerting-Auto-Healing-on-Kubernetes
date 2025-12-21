@@ -1,0 +1,286 @@
+name: SRE AKS CI/CD Pipeline
+
+on:
+  push:
+    branches: ["main"]
+  pull_request:
+    branches: ["main"]
+  workflow_dispatch:
+
+env:
+  TF_VERSION: "1.6.6"
+  IMAGE_NAME: k8s-sre-monitoring-app
+  LOCATION: eastus
+  RESOURCE_GROUP: rg-sre-monitoring-dev
+
+jobs:
+  terraform:
+    name: Terraform Infrastructure
+    runs-on: ubuntu-latest
+    
+    outputs:
+      acr_login_server: ${{ steps.tfout.outputs.acr }}
+      aks_cluster_name: ${{ steps.tfout.outputs.aks }}
+      resource_group: ${{ steps.tfout.outputs.rg }}
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login (Service Principal)
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Terraform Format Check
+        working-directory: terraform
+        run: terraform fmt -check -recursive
+        continue-on-error: true
+
+      - name: Terraform Init
+        working-directory: terraform
+        run: terraform init
+
+      - name: Terraform Validate
+        working-directory: terraform
+        run: terraform validate
+
+      - name: Terraform Plan
+        working-directory: terraform
+        run: |
+          terraform plan \
+            -var-file=environments/dev/terraform.tfvars \
+            -out=tfplan
+
+      - name: Terraform Apply
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        working-directory: terraform
+        run: terraform apply -auto-approve tfplan
+
+      - name: Export Terraform Outputs
+        id: tfout
+        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        working-directory: terraform
+        run: |
+          echo "acr=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
+          echo "aks=$(terraform output -raw aks_cluster_name)" >> $GITHUB_OUTPUT
+          echo "rg=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
+
+  build-and-push:
+    name: Build & Push Docker Image
+    needs: terraform
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Login to Azure Container Registry
+        run: az acr login --name ${{ needs.terraform.outputs.acr_login_server }}
+
+      - name: Build Docker Image
+        working-directory: app
+        run: |
+          docker build \
+            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest \
+            .
+
+      - name: Push Docker Image
+        run: |
+          docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+          docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest
+
+      - name: Scan Image for Vulnerabilities
+        run: |
+          az acr check-health --name ${{ needs.terraform.outputs.acr_login_server }} --yes
+        continue-on-error: true
+
+  deploy-app:
+    name: Deploy Application to AKS
+    needs: [terraform, build-and-push]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ needs.terraform.outputs.resource_group }} \
+            --name ${{ needs.terraform.outputs.aks_cluster_name }} \
+            --overwrite-existing
+
+      - name: Create App Namespace
+        run: kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Update Image in Deployment
+        run: |
+          sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" k8s/app/deployment.yaml
+
+      - name: Deploy Application
+        run: |
+          kubectl apply -f k8s/app/deployment.yaml -n app
+          kubectl apply -f k8s/app/service.yaml -n app
+          kubectl apply -f k8s/app/hpa.yaml -n app
+
+      - name: Wait for Rollout
+        run: |
+          kubectl rollout status deployment/sre-app -n app --timeout=5m
+
+      - name: Verify Deployment
+        run: |
+          kubectl get pods -n app
+          kubectl get svc -n app
+          echo "Application deployed successfully!"
+
+  deploy-monitoring:
+    name: Deploy Monitoring Stack
+    needs: [terraform, deploy-app]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ needs.terraform.outputs.resource_group }} \
+            --name ${{ needs.terraform.outputs.aks_cluster_name }} \
+            --overwrite-existing
+
+      - name: Add Helm Repositories
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo add grafana https://grafana.github.io/helm-charts
+          helm repo update
+
+      - name: Create Monitoring Namespace
+        run: kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
+
+      - name: Install/Upgrade Prometheus Stack
+        run: |
+          helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+            -n monitoring \
+            --create-namespace \
+            --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
+            --set grafana.adminPassword=admin123 \
+            --timeout 10m \
+            --wait
+
+      - name: Verify Monitoring Stack
+        run: |
+          kubectl get pods -n monitoring
+          kubectl get svc -n monitoring
+          echo "Monitoring stack deployed successfully!"
+
+      - name: Get Grafana Admin Password
+        run: |
+          echo "Grafana admin password:"
+          kubectl get secret --namespace monitoring monitoring-grafana -o jsonpath="{.data.admin-password}" | base64 --decode
+          echo ""
+
+  smoke-test:
+    name: Smoke Tests
+    needs: [deploy-app, deploy-monitoring]
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          creds: ${{ secrets.AZURE_CREDENTIALS }}
+
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ needs.terraform.outputs.resource_group }} \
+            --name ${{ needs.terraform.outputs.aks_cluster_name }} \
+            --overwrite-existing
+
+      - name: Test Application Health
+        run: |
+          kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n app -- \
+            curl -f http://sre-app-service:3000/health || exit 1
+        timeout-minutes: 2
+
+      - name: Test Metrics Endpoint
+        run: |
+          kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n app -- \
+            curl -f http://sre-app-service:3000/metrics || exit 1
+        timeout-minutes: 2
+
+      - name: Verify Prometheus
+        run: |
+          kubectl get pods -n monitoring -l app.kubernetes.io/name=prometheus
+          echo "Prometheus is running"
+
+      - name: Verify Grafana
+        run: |
+          kubectl get pods -n monitoring -l app.kubernetes.io/name=grafana
+          echo "Grafana is running"
+
+      - name: Display Service Endpoints
+        run: |
+          echo "=== Application Services ==="
+          kubectl get svc -n app
+          echo ""
+          echo "=== Monitoring Services ==="
+          kubectl get svc -n monitoring
+          echo ""
+          echo "=== Get External IP (if LoadBalancer) ==="
+          kubectl get svc sre-app-service -n app -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+
+  notify:
+    name: Notify Deployment Status
+    needs: [smoke-test]
+    runs-on: ubuntu-latest
+    if: always()
+    
+    steps:
+      - name: Deployment Success
+        if: needs.smoke-test.result == 'success'
+        run: |
+          echo "✅ SRE AKS Deployment Successful!"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref }}"
+          echo "Environment: Production"
+
+      - name: Deployment Failure
+        if: needs.smoke-test.result != 'success'
+        run: |
+          echo "❌ SRE AKS Deployment Failed!"
+          echo "Commit: ${{ github.sha }}"
+          echo "Branch: ${{ github.ref }}"
+          echo "Please check the workflow logs for details"
+          exit 1
