@@ -44,30 +44,58 @@ jobs:
         continue-on-error: true
 
       - name: Terraform Init
-        working-directory: terraform
-        run: terraform init
+        run: |
+          cd terraform
+          terraform init
 
       - name: Terraform Validate
-        working-directory: terraform
-        run: terraform validate
+        run: |
+          cd terraform
+          terraform validate
+
+      - name: Debug - Check Directory Structure
+        run: |
+          pwd
+          echo "=== Root directory ==="
+          ls -la
+          echo ""
+          echo "=== Terraform directory ==="
+          ls -la terraform/
+          echo ""
+          echo "=== Check if environments exists ==="
+          ls -la terraform/environments/ || echo "environments directory not found"
+          echo ""
+          echo "=== Check if dev exists ==="
+          ls -la terraform/environments/dev/ || echo "dev directory not found"
+          echo ""
+          echo "=== Find all tfvars files ==="
+          find . -name "*.tfvars" -type f
 
       - name: Terraform Plan
         run: |
           cd terraform
           terraform plan \
-            -var-file=environments/dev/terraform.tfvars \
+            -var="location=${{ env.LOCATION }}" \
+            -var="environment=dev" \
+            -var="resource_group_name=${{ env.RESOURCE_GROUP }}" \
+            -var="acr_name=acrsremonitoringdev" \
+            -var="acr_sku=Basic" \
+            -var="aks_cluster_name=aks-sre-monitoring-dev" \
+            -var="aks_dns_prefix=aks-sre-dev" \
+            -var="kubernetes_version=1.28" \
             -out=tfplan
 
       - name: Terraform Apply
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        working-directory: terraform
-        run: terraform apply -auto-approve tfplan
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
 
       - name: Export Terraform Outputs
         id: tfout
         if: github.ref == 'refs/heads/main' && github.event_name == 'push'
-        working-directory: terraform
         run: |
+          cd terraform
           echo "acr=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
           echo "aks=$(terraform output -raw aks_cluster_name)" >> $GITHUB_OUTPUT
           echo "rg=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
