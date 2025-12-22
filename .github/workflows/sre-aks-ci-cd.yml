@@ -9,11 +9,11 @@ env:
   TF_VERSION: "1.6.6"
   IMAGE_NAME: k8s-sre-monitoring-app
 
-  # Infra
+  # Resource Groups
   RESOURCE_GROUP: rg-sre-monitoring-dev
+  BACKEND_RESOURCE_GROUP: rg-terraform-state
 
   # Terraform Backend
-  BACKEND_RESOURCE_GROUP: rg-terraform-state
   BACKEND_STORAGE_ACCOUNT: tfstatesremonitoring
   BACKEND_CONTAINER: tfstate
   BACKEND_KEY: sre-monitoring-dev.tfstate
@@ -32,14 +32,29 @@ jobs:
       aks_cluster_name: ${{ steps.tfout.outputs.aks }}
       resource_group: ${{ steps.tfout.outputs.rg }}
 
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Azure Login
+    # 🔐 Azure Login using OIDC
+    - name: Azure Login (OIDC)
       uses: azure/login@v2
       with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+    # 🔑 Export ARM variables for Terraform (CRITICAL FIX)
+    - name: Export Azure credentials for Terraform
+      run: |
+        echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
+        echo "ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+        echo "ARM_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+        echo "ARM_USE_OIDC=true" >> $GITHUB_ENV
 
     - name: Setup Terraform
       uses: hashicorp/setup-terraform@v3
@@ -50,13 +65,13 @@ jobs:
     # ---------- SAFE BACKEND CREATION ----------
     - name: Create Terraform Backend (SAFE)
       run: |
-        echo "🔧 Creating backend resource group..."
+        echo "Creating backend resource group..."
         az group create \
           --name ${{ env.BACKEND_RESOURCE_GROUP }} \
           --location eastus \
           --tags purpose=terraform-state || true
 
-        echo "📦 Creating storage account if needed..."
+        echo "Creating storage account if not exists..."
         az storage account create \
           --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
           --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
@@ -65,27 +80,24 @@ jobs:
           --https-only true \
           --allow-blob-public-access false || true
 
-        echo "⏳ Waiting for storage account availability..."
+        echo "Waiting for storage account propagation..."
         for i in {1..10}; do
           if az storage account show \
             --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
             --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} &>/dev/null; then
-            echo "✅ Storage account available"
+            echo "Storage account available"
             break
           fi
-          echo "Waiting ($i/10)..."
           sleep 10
         done
 
-        echo "📂 Creating blob container..."
+        echo "Creating blob container..."
         az storage container create \
           --name ${{ env.BACKEND_CONTAINER }} \
           --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
           --auth-mode login || true
 
-        echo "✅ Terraform backend ready"
-
-    - name: Terraform Init
+    - name: Terraform Init (Remote Backend)
       run: |
         cd terraform
         terraform init -upgrade \
@@ -128,6 +140,10 @@ jobs:
     needs: terraform
     runs-on: ubuntu-latest
 
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -135,7 +151,9 @@ jobs:
     - name: Azure Login
       uses: azure/login@v2
       with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     - name: Login to ACR
       run: az acr login --name ${{ needs.terraform.outputs.acr_name }}
@@ -161,6 +179,10 @@ jobs:
     needs: [terraform, build-and-push]
     runs-on: ubuntu-latest
 
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
@@ -168,7 +190,9 @@ jobs:
     - name: Azure Login
       uses: azure/login@v2
       with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     - name: Get AKS Credentials
       run: |
@@ -184,7 +208,7 @@ jobs:
       run: |
         sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" k8s/app/deployment.yaml
 
-    - name: Deploy Kubernetes Manifests
+    - name: Deploy App
       run: |
         kubectl apply -n app -f k8s/app/deployment.yaml
         kubectl apply -n app -f k8s/app/service.yaml
@@ -194,18 +218,24 @@ jobs:
       run: kubectl rollout status deployment/sre-app -n app --timeout=5m
 
 # ============================================================
-# 4️⃣ DEPLOY MONITORING STACK
+# 4️⃣ DEPLOY MONITORING (PROMETHEUS + GRAFANA)
 # ============================================================
   deploy-monitoring:
     name: Deploy Monitoring
     needs: deploy-app
     runs-on: ubuntu-latest
 
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
     - name: Azure Login
       uses: azure/login@v2
       with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     - name: Get AKS Credentials
       run: |
@@ -238,11 +268,17 @@ jobs:
     needs: deploy-monitoring
     runs-on: ubuntu-latest
 
+    permissions:
+      id-token: write
+      contents: read
+
     steps:
     - name: Azure Login
       uses: azure/login@v2
       with:
-        creds: ${{ secrets.AZURE_CREDENTIALS }}
+        client-id: ${{ secrets.AZURE_CLIENT_ID }}
+        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
     - name: Get AKS Credentials
       run: |
