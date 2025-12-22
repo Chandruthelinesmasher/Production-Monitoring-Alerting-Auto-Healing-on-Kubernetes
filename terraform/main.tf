@@ -48,21 +48,7 @@ module "aks" {
   depends_on = [module.resource_group]
 }
 
-# Attach ACR to AKS
-# Note: Role assignment is handled by the CI/CD pipeline using Azure CLI
-# This is commented out to avoid authorization errors during Terraform execution
-# The pipeline step "Configure ACR Pull Permission for AKS" handles this instead
-
-# resource "azurerm_role_assignment" "aks_acr_pull" {
-#   principal_id                     = module.aks.kubelet_identity_object_id
-#   role_definition_name             = "AcrPull"
-#   scope                            = module.acr.id
-#   skip_service_principal_aad_check = true
-#
-#   depends_on = [module.aks, module.acr]
-# }
-
+# Note: ACR role assignment is now managed in acr_role_assignment.tf
 # Note: Namespaces will be created via kubectl after AKS is provisioned
 # Run: kubectl create namespace app
 #      kubectl create namespace monitoring
-#      kubectl create namespace ingress

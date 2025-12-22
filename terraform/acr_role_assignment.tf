@@ -1,24 +1,18 @@
-# Get AKS kubelet identity
-data "azurerm_user_assigned_identity" "aks_kubelet" {
-  name                = "${azurerm_kubernetes_cluster.aks.name}-agentpool"
-  resource_group_name = azurerm_kubernetes_cluster.aks.node_resource_group
-}
+# ACR Role Assignment for AKS
+# This grants the AKS cluster permission to pull images from ACR
+# This replaces the commented-out role assignment in main.tf
 
-# Grant AcrPull role to AKS kubelet identity
-resource "azurerm_role_assignment" "acr_pull" {
-  scope                = azurerm_container_registry.acr.id
-  role_definition_name = "AcrPull"
-  principal_id         = azurerm_kubernetes_cluster.aks.kubelet_identity[0].object_id
+resource "azurerm_role_assignment" "aks_acr_pull" {
+  principal_id                     = module.aks.kubelet_identity_object_id
+  role_definition_name             = "AcrPull"
+  scope                            = module.acr.id
+  skip_service_principal_aad_check = true
 
-  # Wait for AKS to be fully provisioned
-  depends_on = [
-    azurerm_kubernetes_cluster.aks,
-    azurerm_container_registry.acr
-  ]
+  depends_on = [module.aks, module.acr]
 }
 
 # Output for verification
 output "acr_role_assignment_id" {
-  value       = azurerm_role_assignment.acr_pull.id
+  value       = azurerm_role_assignment.aks_acr_pull.id
   description = "The ID of the ACR role assignment"
 }
