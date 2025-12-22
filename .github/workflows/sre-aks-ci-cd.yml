@@ -8,9 +8,11 @@ on:
 env:
   TF_VERSION: "1.6.6"
   IMAGE_NAME: k8s-sre-monitoring-app
+
+  # Infra
   RESOURCE_GROUP: rg-sre-monitoring-dev
 
-  # Terraform backend
+  # Terraform Backend
   BACKEND_RESOURCE_GROUP: rg-terraform-state
   BACKEND_STORAGE_ACCOUNT: tfstatesremonitoring
   BACKEND_CONTAINER: tfstate
@@ -18,7 +20,7 @@ env:
 
 jobs:
 # ============================================================
-# 1️⃣ TERRAFORM — INFRASTRUCTURE (RG, ACR, AKS)
+# 1️⃣ TERRAFORM — INFRASTRUCTURE
 # ============================================================
   terraform:
     name: Terraform Infrastructure
@@ -34,7 +36,7 @@ jobs:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    - name: Azure Login (OIDC / Service Principal)
+    - name: Azure Login
       uses: azure/login@v2
       with:
         creds: ${{ secrets.AZURE_CREDENTIALS }}
@@ -45,36 +47,45 @@ jobs:
         terraform_version: ${{ env.TF_VERSION }}
         terraform_wrapper: false
 
-    # ---------- Backend Setup ----------
-    - name: Create Terraform Backend (idempotent)
+    # ---------- SAFE BACKEND CREATION ----------
+    - name: Create Terraform Backend (SAFE)
       run: |
+        echo "🔧 Creating backend resource group..."
         az group create \
           --name ${{ env.BACKEND_RESOURCE_GROUP }} \
           --location eastus \
           --tags purpose=terraform-state || true
 
-        if ! az storage account show \
+        echo "📦 Creating storage account if needed..."
+        az storage account create \
           --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
-          --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} &>/dev/null; then
-          az storage account create \
-            --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
-            --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
-            --location eastus \
-            --sku Standard_LRS \
-            --https-only true
-        fi
-
-        ACCOUNT_KEY=$(az storage account keys list \
           --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
-          --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
-          --query '[0].value' -o tsv)
+          --location eastus \
+          --sku Standard_LRS \
+          --https-only true \
+          --allow-blob-public-access false || true
 
+        echo "⏳ Waiting for storage account availability..."
+        for i in {1..10}; do
+          if az storage account show \
+            --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
+            --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} &>/dev/null; then
+            echo "✅ Storage account available"
+            break
+          fi
+          echo "Waiting ($i/10)..."
+          sleep 10
+        done
+
+        echo "📂 Creating blob container..."
         az storage container create \
           --name ${{ env.BACKEND_CONTAINER }} \
           --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
-          --account-key $ACCOUNT_KEY || true
+          --auth-mode login || true
 
-    - name: Terraform Init (Remote Backend)
+        echo "✅ Terraform backend ready"
+
+    - name: Terraform Init
       run: |
         cd terraform
         terraform init -upgrade \
@@ -110,10 +121,10 @@ jobs:
         echo "rg=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
 
 # ============================================================
-# 2️⃣ BUILD & PUSH DOCKER IMAGE TO ACR
+# 2️⃣ BUILD & PUSH DOCKER IMAGE
 # ============================================================
   build-and-push:
-    name: Build & Push Image
+    name: Build & Push Docker Image
     needs: terraform
     runs-on: ubuntu-latest
 
@@ -146,7 +157,7 @@ jobs:
 # 3️⃣ DEPLOY APPLICATION TO AKS
 # ============================================================
   deploy-app:
-    name: Deploy App to AKS
+    name: Deploy Application
     needs: [terraform, build-and-push]
     runs-on: ubuntu-latest
 
@@ -169,7 +180,7 @@ jobs:
     - name: Create App Namespace
       run: kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
 
-    - name: Inject Image into Deployment
+    - name: Inject Image Tag
       run: |
         sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" k8s/app/deployment.yaml
 
@@ -183,7 +194,7 @@ jobs:
       run: kubectl rollout status deployment/sre-app -n app --timeout=5m
 
 # ============================================================
-# 4️⃣ DEPLOY MONITORING STACK (PROMETHEUS + GRAFANA)
+# 4️⃣ DEPLOY MONITORING STACK
 # ============================================================
   deploy-monitoring:
     name: Deploy Monitoring
@@ -191,9 +202,6 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
-
     - name: Azure Login
       uses: azure/login@v2
       with:
