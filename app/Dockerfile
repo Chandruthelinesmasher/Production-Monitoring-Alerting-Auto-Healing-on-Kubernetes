@@ -11,6 +11,12 @@ WORKDIR /app
 COPY --chown=nodejs:nodejs server.js ./
 COPY --chown=nodejs:nodejs package.json ./
 
+# Copy public directory if it exists (for static files)
+COPY --chown=nodejs:nodejs public ./public
+
+# Install dependencies if package.json has any
+RUN npm install --only=production
+
 # Switch to non-root user
 USER nodejs
 
