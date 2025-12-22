@@ -32,7 +32,7 @@ module "aks" {
   resource_group_name = module.resource_group.name
   location            = module.resource_group.location
   dns_prefix          = var.aks_dns_prefix
-  kubernetes_version  = var.kubernetes_version
+  # kubernetes_version removed - Azure will auto-select latest stable version
 
   default_node_pool = var.default_node_pool
 
