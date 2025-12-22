@@ -217,29 +217,31 @@ jobs:
           az aks get-versions --location ${{ env.LOCATION }} --output table
           
           echo ""
-          echo "=== Checking for non-LTS versions ==="
+          echo "=== Extracting ALL patch versions ==="
           
-          # Try to find explicitly supported non-LTS versions
-          # Method 1: Check orchestrator versions (usually non-LTS)
-          NON_LTS_VERSIONS=$(az aks get-versions --location ${{ env.LOCATION }} \
-            --query "orchestrators[?orchestratorType=='Kubernetes' && isPreview==null].orchestratorVersion" \
-            -o tsv 2>/dev/null || echo "")
+          # Get full JSON to inspect all patch versions
+          az aks get-versions --location ${{ env.LOCATION }} -o json > /tmp/k8s_full.json
           
-          if [ -n "$NON_LTS_VERSIONS" ]; then
-            echo "Found orchestrator versions:"
-            echo "$NON_LTS_VERSIONS"
-          fi
-          
-          # Method 2: Get from values array
-          VALUES_VERSIONS=$(az aks get-versions --location ${{ env.LOCATION }} \
-            --query "values[?isPreview==null].version" -o tsv)
+          # Display the structure
+          echo "Available versions structure:"
+          cat /tmp/k8s_full.json | jq -r '.values[] | select(.isPreview == null) | {version: .version, patches: .patchVersions | keys}'
           
           echo ""
-          echo "Available versions from values array:"
-          echo "$VALUES_VERSIONS"
+          echo "=== Looking for oldest supported patch versions ==="
+          
+          # Extract ALL patch versions (oldest patches are typically non-LTS)
+          ALL_PATCHES=$(cat /tmp/k8s_full.json | jq -r '
+            .values[] | 
+            select(.isPreview == null) | 
+            .patchVersions | 
+            keys[]
+          ' | sort -V)
+          
+          echo "All available patch versions:"
+          echo "$ALL_PATCHES"
           
           # Store for next step
-          echo "$VALUES_VERSIONS" > /tmp/k8s_versions.txt
+          echo "$ALL_PATCHES" > /tmp/k8s_patches.txt
 
       - name: Terraform Plan
         id: plan
@@ -248,27 +250,44 @@ jobs:
           
           echo "Determining best Kubernetes version..."
           
-          # Read available versions
-          VERSIONS=$(cat /tmp/k8s_versions.txt)
+          # Read available patch versions
+          ALL_PATCHES=$(cat /tmp/k8s_patches.txt)
           
-          # Strategy: Use minor version only (1.29, 1.30) to let Azure select the best patch
-          # This avoids LTS-specific patch versions
-          if echo "$VERSIONS" | grep -q "^1\.29"; then
-            K8S_VERSION="1.29"
-            echo "✅ Selected Kubernetes 1.29 (let Azure choose patch version)"
-          elif echo "$VERSIONS" | grep -q "^1\.28"; then
-            K8S_VERSION="1.28"
-            echo "✅ Selected Kubernetes 1.28 (let Azure choose patch version)"
-          elif echo "$VERSIONS" | grep -q "^1\.30"; then
-            K8S_VERSION="1.30"
-            echo "⚠️ Selected Kubernetes 1.30 (may have LTS restrictions)"
+          echo "All patches available:"
+          echo "$ALL_PATCHES"
+          
+          # Strategy 1: Try to find oldest 1.28.x (most likely to be non-LTS)
+          K8S_VERSION=$(echo "$ALL_PATCHES" | grep "^1\.28\." | head -n 1)
+          
+          if [ -n "$K8S_VERSION" ]; then
+            echo "✅ Selected oldest 1.28 patch: $K8S_VERSION"
           else
-            # Last resort
-            K8S_VERSION=$(echo "$VERSIONS" | grep -v "^1\.31" | sort -V | tail -n1 | cut -d'.' -f1,2)
-            echo "⚠️ Fallback to version: $K8S_VERSION"
+            # Strategy 2: Try oldest 1.29.x
+            K8S_VERSION=$(echo "$ALL_PATCHES" | grep "^1\.29\." | head -n 1)
+            if [ -n "$K8S_VERSION" ]; then
+              echo "⚠️ Selected oldest 1.29 patch: $K8S_VERSION (may be LTS)"
+            else
+              # Strategy 3: Try oldest 1.27.x
+              K8S_VERSION=$(echo "$ALL_PATCHES" | grep "^1\.27\." | head -n 1)
+              if [ -n "$K8S_VERSION" ]; then
+                echo "⚠️ Selected oldest 1.27 patch: $K8S_VERSION"
+              else
+                # Last resort: get oldest overall non-1.31 version
+                K8S_VERSION=$(echo "$ALL_PATCHES" | grep -v "^1\.31\." | head -n 1)
+                echo "⚠️ Fallback to oldest available: $K8S_VERSION"
+              fi
+            fi
           fi
           
-          echo "Selected Kubernetes version: $K8S_VERSION"
+          if [ -z "$K8S_VERSION" ]; then
+            echo "❌ ERROR: No suitable Kubernetes version found!"
+            echo "Available versions:"
+            echo "$ALL_PATCHES"
+            exit 1
+          fi
+          
+          echo ""
+          echo "Final selected version: $K8S_VERSION"
           echo "k8s_version=${K8S_VERSION}" >> $GITHUB_OUTPUT
           
           # Run plan
