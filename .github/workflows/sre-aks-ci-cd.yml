@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  id-token: write        # REQUIRED for OIDC
+  id-token: write     # REQUIRED for OIDC
   contents: read
 
 env:
@@ -26,8 +26,11 @@ env:
   BACKEND_KEY: sre-monitoring-dev.tfstate
 
 jobs:
+# ==========================================================
+# TERRAFORM – INFRASTRUCTURE
+# ==========================================================
   terraform:
-    name: Provision Infrastructure (Terraform)
+    name: Terraform Infra
     runs-on: ubuntu-latest
 
     outputs:
@@ -37,14 +40,11 @@ jobs:
       resource_group: ${{ steps.tfout.outputs.resource_group }}
 
     steps:
-      # -----------------------------
-      # Checkout
-      # -----------------------------
-      - name: Checkout Repository
+      - name: Checkout Code
         uses: actions/checkout@v4
 
       # -----------------------------
-      # Azure Login (OIDC)
+      # Azure Login (OIDC ONLY)
       # -----------------------------
       - name: Azure Login (OIDC)
         uses: azure/login@v2
@@ -56,7 +56,7 @@ jobs:
       # -----------------------------
       # Export ARM vars for Terraform
       # -----------------------------
-      - name: Export Azure creds for Terraform
+      - name: Export ARM variables
         run: |
           echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
           echo "ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
@@ -73,9 +73,9 @@ jobs:
           terraform_wrapper: false
 
       # -----------------------------
-      # Create Terraform Backend (Idempotent)
+      # Backend Storage (Idempotent)
       # -----------------------------
-      - name: Setup Terraform Backend Storage
+      - name: Setup Terraform Backend
         run: |
           az group create \
             --name $BACKEND_RESOURCE_GROUP \
@@ -115,17 +115,11 @@ jobs:
             -backend-config="container_name=$BACKEND_CONTAINER" \
             -backend-config="key=$BACKEND_KEY"
 
-      # -----------------------------
-      # Terraform Validate
-      # -----------------------------
       - name: Terraform Validate
         run: |
           cd terraform
           terraform validate
 
-      # -----------------------------
-      # Terraform Plan (Stable AKS Version)
-      # -----------------------------
       - name: Terraform Plan
         run: |
           cd terraform
@@ -136,17 +130,11 @@ jobs:
             -var="kubernetes_version=1.27.9" \
             -out=tfplan
 
-      # -----------------------------
-      # Terraform Apply
-      # -----------------------------
       - name: Terraform Apply
         run: |
           cd terraform
           terraform apply -auto-approve tfplan
 
-      # -----------------------------
-      # Export Outputs
-      # -----------------------------
       - name: Export Terraform Outputs
         id: tfout
         run: |
@@ -156,9 +144,9 @@ jobs:
           echo "aks_name=$(terraform output -raw aks_cluster_name)" >> $GITHUB_OUTPUT
           echo "resource_group=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
 
-  # ==========================================================
-  # BUILD & PUSH DOCKER IMAGE
-  # ==========================================================
+# ==========================================================
+# BUILD & PUSH IMAGE
+# ==========================================================
   build-and-push:
     name: Build & Push Docker Image
     needs: terraform
@@ -177,19 +165,19 @@ jobs:
       - name: Login to ACR
         run: az acr login --name ${{ needs.terraform.outputs.acr_name }}
 
-      - name: Build Docker Image
+      - name: Build Image
         working-directory: app
         run: |
           docker build \
             -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest .
 
-      - name: Push Docker Image
+      - name: Push Image
         run: |
           docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest
 
-  # ==========================================================
-  # DEPLOY APPLICATION + MONITORING
-  # ==========================================================
+# ==========================================================
+# DEPLOY APP + MONITORING
+# ==========================================================
   deploy:
     name: Deploy App & Monitoring
     needs: [terraform, build-and-push]
@@ -220,7 +208,7 @@ jobs:
       - name: Deploy Application
         run: |
           sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest|g" k8s/app/deployment.yaml
-          kubectl apply -f k8s/app/ -n app
+          kubectl apply -f k8s/app -n app
 
       - name: Deploy Monitoring Stack
         run: |
