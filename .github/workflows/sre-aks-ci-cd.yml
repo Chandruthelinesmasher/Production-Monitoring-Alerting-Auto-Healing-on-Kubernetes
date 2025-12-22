@@ -5,231 +5,228 @@ on:
     branches: ["main"]
   workflow_dispatch:
 
+permissions:
+  id-token: write        # REQUIRED for OIDC
+  contents: read
+
 env:
   TF_VERSION: "1.6.6"
+
+  # App
   IMAGE_NAME: k8s-sre-monitoring-app
 
-  # Resource Groups
+  # Infra
+  LOCATION: eastus
   RESOURCE_GROUP: rg-sre-monitoring-dev
-  BACKEND_RESOURCE_GROUP: rg-terraform-state
 
   # Terraform Backend
+  BACKEND_RESOURCE_GROUP: rg-terraform-state
   BACKEND_STORAGE_ACCOUNT: tfstatesremonitoring
   BACKEND_CONTAINER: tfstate
   BACKEND_KEY: sre-monitoring-dev.tfstate
 
 jobs:
-# ============================================================
-# 1️⃣ TERRAFORM — INFRASTRUCTURE
-# ============================================================
   terraform:
-    name: Terraform Infrastructure
+    name: Provision Infrastructure (Terraform)
     runs-on: ubuntu-latest
 
-    permissions:
-      id-token: write
-      contents: read
-
     outputs:
-      acr_login_server: ${{ steps.tfout.outputs.acr }}
+      acr_login_server: ${{ steps.tfout.outputs.acr_login_server }}
       acr_name: ${{ steps.tfout.outputs.acr_name }}
-      aks_cluster_name: ${{ steps.tfout.outputs.aks }}
-      resource_group: ${{ steps.tfout.outputs.rg }}
+      aks_name: ${{ steps.tfout.outputs.aks_name }}
+      resource_group: ${{ steps.tfout.outputs.resource_group }}
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+      # -----------------------------
+      # Checkout
+      # -----------------------------
+      - name: Checkout Repository
+        uses: actions/checkout@v4
 
-    # 🔐 Azure Login (OIDC — CORRECT WAY)
-    - name: Azure Login
-      uses: azure/login@v2
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      # -----------------------------
+      # Azure Login (OIDC)
+      # -----------------------------
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    # 🔑 Export ARM vars for Terraform (MANDATORY)
-    - name: Export Azure credentials for Terraform
-      run: |
-        echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
-        echo "ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
-        echo "ARM_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
-        echo "ARM_USE_OIDC=true" >> $GITHUB_ENV
+      # -----------------------------
+      # Export ARM vars for Terraform
+      # -----------------------------
+      - name: Export Azure creds for Terraform
+        run: |
+          echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
+          echo "ARM_TENANT_ID=${{ secrets.AZURE_TENANT_ID }}" >> $GITHUB_ENV
+          echo "ARM_SUBSCRIPTION_ID=${{ secrets.AZURE_SUBSCRIPTION_ID }}" >> $GITHUB_ENV
+          echo "ARM_USE_OIDC=true" >> $GITHUB_ENV
 
-    - name: Setup Terraform
-      uses: hashicorp/setup-terraform@v3
-      with:
-        terraform_version: ${{ env.TF_VERSION }}
-        terraform_wrapper: false
+      # -----------------------------
+      # Setup Terraform
+      # -----------------------------
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
 
-    # ---------- SAFE BACKEND CREATION ----------
-    - name: Create Terraform Backend
-      run: |
-        az group create \
-          --name ${{ env.BACKEND_RESOURCE_GROUP }} \
-          --location eastus || true
+      # -----------------------------
+      # Create Terraform Backend (Idempotent)
+      # -----------------------------
+      - name: Setup Terraform Backend Storage
+        run: |
+          az group create \
+            --name $BACKEND_RESOURCE_GROUP \
+            --location $LOCATION \
+            --tags purpose=terraform-state || true
 
-        az storage account create \
-          --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
-          --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
-          --location eastus \
-          --sku Standard_LRS \
-          --https-only true \
-          --allow-blob-public-access false || true
+          if ! az storage account show \
+            --name $BACKEND_STORAGE_ACCOUNT \
+            --resource-group $BACKEND_RESOURCE_GROUP &>/dev/null; then
+            az storage account create \
+              --name $BACKEND_STORAGE_ACCOUNT \
+              --resource-group $BACKEND_RESOURCE_GROUP \
+              --location $LOCATION \
+              --sku Standard_LRS \
+              --https-only true
+          fi
 
-        echo "Waiting for storage account..."
-        for i in {1..10}; do
-          az storage account show \
-            --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
-            --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} && break
-          sleep 10
-        done
+          ACCOUNT_KEY=$(az storage account keys list \
+            --resource-group $BACKEND_RESOURCE_GROUP \
+            --account-name $BACKEND_STORAGE_ACCOUNT \
+            --query '[0].value' -o tsv)
 
-        az storage container create \
-          --name ${{ env.BACKEND_CONTAINER }} \
-          --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
-          --auth-mode login || true
+          az storage container create \
+            --name $BACKEND_CONTAINER \
+            --account-name $BACKEND_STORAGE_ACCOUNT \
+            --account-key $ACCOUNT_KEY || true
 
-    - name: Terraform Init
-      run: |
-        cd terraform
-        terraform init -upgrade \
-          -backend-config="resource_group_name=${{ env.BACKEND_RESOURCE_GROUP }}" \
-          -backend-config="storage_account_name=${{ env.BACKEND_STORAGE_ACCOUNT }}" \
-          -backend-config="container_name=${{ env.BACKEND_CONTAINER }}" \
-          -backend-config="key=${{ env.BACKEND_KEY }}"
+      # -----------------------------
+      # Terraform Init
+      # -----------------------------
+      - name: Terraform Init
+        run: |
+          cd terraform
+          terraform init -upgrade \
+            -backend-config="resource_group_name=$BACKEND_RESOURCE_GROUP" \
+            -backend-config="storage_account_name=$BACKEND_STORAGE_ACCOUNT" \
+            -backend-config="container_name=$BACKEND_CONTAINER" \
+            -backend-config="key=$BACKEND_KEY"
 
-    - name: Terraform Validate
-      run: |
-        cd terraform
-        terraform validate
+      # -----------------------------
+      # Terraform Validate
+      # -----------------------------
+      - name: Terraform Validate
+        run: |
+          cd terraform
+          terraform validate
 
-    - name: Terraform Plan
-      run: |
-        cd terraform
-        terraform plan \
-          -var-file=environments/dev/terraform.tfvars \
-          -out=tfplan
+      # -----------------------------
+      # Terraform Plan (Stable AKS Version)
+      # -----------------------------
+      - name: Terraform Plan
+        run: |
+          cd terraform
+          terraform plan \
+            -var="location=$LOCATION" \
+            -var="resource_group_name=$RESOURCE_GROUP" \
+            -var="environment=dev" \
+            -var="kubernetes_version=1.27.9" \
+            -out=tfplan
 
-    - name: Terraform Apply
-      run: |
-        cd terraform
-        terraform apply -auto-approve tfplan
+      # -----------------------------
+      # Terraform Apply
+      # -----------------------------
+      - name: Terraform Apply
+        run: |
+          cd terraform
+          terraform apply -auto-approve tfplan
 
-    - name: Export Terraform Outputs
-      id: tfout
-      run: |
-        cd terraform
-        echo "acr=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
-        echo "acr_name=$(terraform output -raw acr_name)" >> $GITHUB_OUTPUT
-        echo "aks=$(terraform output -raw aks_cluster_name)" >> $GITHUB_OUTPUT
-        echo "rg=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
+      # -----------------------------
+      # Export Outputs
+      # -----------------------------
+      - name: Export Terraform Outputs
+        id: tfout
+        run: |
+          cd terraform
+          echo "acr_login_server=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
+          echo "acr_name=$(terraform output -raw acr_name)" >> $GITHUB_OUTPUT
+          echo "aks_name=$(terraform output -raw aks_cluster_name)" >> $GITHUB_OUTPUT
+          echo "resource_group=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
 
-# ============================================================
-# 2️⃣ BUILD & PUSH DOCKER IMAGE
-# ============================================================
+  # ==========================================================
+  # BUILD & PUSH DOCKER IMAGE
+  # ==========================================================
   build-and-push:
     name: Build & Push Docker Image
     needs: terraform
     runs-on: ubuntu-latest
 
-    permissions:
-      id-token: write
-      contents: read
-
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Azure Login
-      uses: azure/login@v2
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    - name: Login to ACR
-      run: az acr login --name ${{ needs.terraform.outputs.acr_name }}
+      - name: Login to ACR
+        run: az acr login --name ${{ needs.terraform.outputs.acr_name }}
 
-    - name: Build & Push Image
-      working-directory: k8s/app
-      run: |
-        docker build \
-          -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-          -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest .
-        docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
-        docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest
+      - name: Build Docker Image
+        working-directory: app
+        run: |
+          docker build \
+            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest .
 
-# ============================================================
-# 3️⃣ DEPLOY APP TO AKS
-# ============================================================
-  deploy-app:
-    name: Deploy Application
+      - name: Push Docker Image
+        run: |
+          docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest
+
+  # ==========================================================
+  # DEPLOY APPLICATION + MONITORING
+  # ==========================================================
+  deploy:
+    name: Deploy App & Monitoring
     needs: [terraform, build-and-push]
     runs-on: ubuntu-latest
 
-    permissions:
-      id-token: write
-      contents: read
-
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Azure Login
-      uses: azure/login@v2
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+      - name: Azure Login (OIDC)
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    - name: Get AKS Credentials
-      run: |
-        az aks get-credentials \
-          --resource-group ${{ needs.terraform.outputs.resource_group }} \
-          --name ${{ needs.terraform.outputs.aks_cluster_name }} \
-          --overwrite-existing
+      - name: Get AKS Credentials
+        run: |
+          az aks get-credentials \
+            --resource-group ${{ needs.terraform.outputs.resource_group }} \
+            --name ${{ needs.terraform.outputs.aks_name }} \
+            --overwrite-existing
 
-    - name: Deploy App
-      run: |
-        kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
-        sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" k8s/app/deployment.yaml
-        kubectl apply -n app -f k8s/app/
+      - name: Create Namespaces
+        run: |
+          kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
+          kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
 
-    - name: Wait for Rollout
-      run: kubectl rollout status deployment/sre-app -n app --timeout=5m
+      - name: Deploy Application
+        run: |
+          sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest|g" k8s/app/deployment.yaml
+          kubectl apply -f k8s/app/ -n app
 
-# ============================================================
-# 4️⃣ DEPLOY MONITORING
-# ============================================================
-  deploy-monitoring:
-    name: Deploy Monitoring
-    needs: deploy-app
-    runs-on: ubuntu-latest
-
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-    - name: Azure Login
-      uses: azure/login@v2
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-    - name: Get AKS Credentials
-      run: |
-        az aks get-credentials \
-          --resource-group ${{ needs.terraform.outputs.resource_group }} \
-          --name ${{ needs.terraform.outputs.aks_cluster_name }} \
-          --overwrite-existing
-
-    - name: Install Prometheus + Grafana
-      run: |
-        helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-        helm repo update
-        kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
-        helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
-          -n monitoring \
-          --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-          --wait
+      - name: Deploy Monitoring Stack
+        run: |
+          helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+          helm repo update
+          helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
+            -n monitoring \
+            --set grafana.adminPassword=admin123 \
+            --wait
