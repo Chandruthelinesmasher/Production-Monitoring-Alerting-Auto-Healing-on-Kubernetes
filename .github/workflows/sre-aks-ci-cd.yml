@@ -132,6 +132,29 @@ jobs:
           cd terraform
           terraform apply -auto-approve tfplan
 
+      # -----------------------------
+      # Manual ACR Role Assignment (Workaround)
+      # -----------------------------
+      - name: Configure ACR Pull Permission for AKS
+        run: |
+          # Get the AKS kubelet identity
+          AKS_KUBELET_ID=$(az aks show \
+            --resource-group $RESOURCE_GROUP \
+            --name $(cd terraform && terraform output -raw aks_cluster_name) \
+            --query identityProfile.kubeletidentity.objectId -o tsv)
+          
+          # Get ACR resource ID
+          ACR_ID=$(az acr show \
+            --name $(cd terraform && terraform output -raw acr_name) \
+            --resource-group $RESOURCE_GROUP \
+            --query id -o tsv)
+          
+          # Assign AcrPull role (idempotent)
+          az role assignment create \
+            --assignee $AKS_KUBELET_ID \
+            --role AcrPull \
+            --scope $ACR_ID || echo "Role assignment already exists"
+
       - name: Export Terraform Outputs
         id: tfout
         run: |

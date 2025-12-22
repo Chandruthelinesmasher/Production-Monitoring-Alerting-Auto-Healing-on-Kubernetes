@@ -49,14 +49,18 @@ module "aks" {
 }
 
 # Attach ACR to AKS
-resource "azurerm_role_assignment" "aks_acr_pull" {
-  principal_id                     = module.aks.kubelet_identity_object_id
-  role_definition_name             = "AcrPull"
-  scope                            = module.acr.id
-  skip_service_principal_aad_check = true
+# Note: Role assignment is handled by the CI/CD pipeline using Azure CLI
+# This is commented out to avoid authorization errors during Terraform execution
+# The pipeline step "Configure ACR Pull Permission for AKS" handles this instead
 
-  depends_on = [module.aks, module.acr]
-}
+# resource "azurerm_role_assignment" "aks_acr_pull" {
+#   principal_id                     = module.aks.kubelet_identity_object_id
+#   role_definition_name             = "AcrPull"
+#   scope                            = module.acr.id
+#   skip_service_principal_aad_check = true
+#
+#   depends_on = [module.aks, module.acr]
+# }
 
 # Note: Namespaces will be created via kubectl after AKS is provisioned
 # Run: kubectl create namespace app
