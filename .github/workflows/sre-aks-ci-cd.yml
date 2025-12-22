@@ -15,7 +15,7 @@ env:
   IMAGE_NAME: k8s-sre-monitoring-app
 
   # Infra
-  LOCATION: eastus
+  LOCATION: eastus2  # Changed from eastus to eastus2 for availability zone support
   RESOURCE_GROUP: rg-sre-monitoring-dev
 
   # Terraform Backend
