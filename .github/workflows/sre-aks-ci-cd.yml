@@ -209,34 +209,63 @@ jobs:
           echo "✅ All required resource providers registered"
 
       - name: Get Available Kubernetes Versions
+        id: k8s_versions
         run: |
           echo "Getting available Kubernetes versions for ${{ env.LOCATION }}..."
+          
+          # Get full detailed output
           az aks get-versions --location ${{ env.LOCATION }} --output table
+          
+          echo ""
+          echo "=== Checking for non-LTS versions ==="
+          
+          # Try to find explicitly supported non-LTS versions
+          # Method 1: Check orchestrator versions (usually non-LTS)
+          NON_LTS_VERSIONS=$(az aks get-versions --location ${{ env.LOCATION }} \
+            --query "orchestrators[?orchestratorType=='Kubernetes' && isPreview==null].orchestratorVersion" \
+            -o tsv 2>/dev/null || echo "")
+          
+          if [ -n "$NON_LTS_VERSIONS" ]; then
+            echo "Found orchestrator versions:"
+            echo "$NON_LTS_VERSIONS"
+          fi
+          
+          # Method 2: Get from values array
+          VALUES_VERSIONS=$(az aks get-versions --location ${{ env.LOCATION }} \
+            --query "values[?isPreview==null].version" -o tsv)
+          
+          echo ""
+          echo "Available versions from values array:"
+          echo "$VALUES_VERSIONS"
+          
+          # Store for next step
+          echo "$VALUES_VERSIONS" > /tmp/k8s_versions.txt
 
       - name: Terraform Plan
         id: plan
         run: |
           cd terraform
           
-          # Get available Kubernetes versions (non-preview only)
-          echo "Fetching available Kubernetes versions..."
-          VERSIONS=$(az aks get-versions --location ${{ env.LOCATION }} --query "values[?isPreview==null].version" -o tsv)
-          echo "Available versions: $VERSIONS"
+          echo "Determining best Kubernetes version..."
           
-          # Select version - prefer 1.30, avoid 1.31 (LTS-only), fallback to latest stable
-          if echo "$VERSIONS" | grep -q "^1\.30"; then
-            K8S_VERSION="1.30"
-            echo "✅ Selected Kubernetes version 1.30 (stable, non-LTS)"
-          elif echo "$VERSIONS" | grep -q "^1\.29"; then
+          # Read available versions
+          VERSIONS=$(cat /tmp/k8s_versions.txt)
+          
+          # Strategy: Use minor version only (1.29, 1.30) to let Azure select the best patch
+          # This avoids LTS-specific patch versions
+          if echo "$VERSIONS" | grep -q "^1\.29"; then
             K8S_VERSION="1.29"
-            echo "✅ Selected Kubernetes version 1.29 (stable, non-LTS)"
+            echo "✅ Selected Kubernetes 1.29 (let Azure choose patch version)"
           elif echo "$VERSIONS" | grep -q "^1\.28"; then
             K8S_VERSION="1.28"
-            echo "✅ Selected Kubernetes version 1.28 (stable, non-LTS)"
+            echo "✅ Selected Kubernetes 1.28 (let Azure choose patch version)"
+          elif echo "$VERSIONS" | grep -q "^1\.30"; then
+            K8S_VERSION="1.30"
+            echo "⚠️ Selected Kubernetes 1.30 (may have LTS restrictions)"
           else
-            # Fallback: get the latest non-1.31 version
+            # Last resort
             K8S_VERSION=$(echo "$VERSIONS" | grep -v "^1\.31" | sort -V | tail -n1 | cut -d'.' -f1,2)
-            echo "⚠️ Using fallback version: $K8S_VERSION"
+            echo "⚠️ Fallback to version: $K8S_VERSION"
           fi
           
           echo "Selected Kubernetes version: $K8S_VERSION"
