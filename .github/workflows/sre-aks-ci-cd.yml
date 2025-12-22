@@ -12,6 +12,11 @@ env:
   IMAGE_NAME: k8s-sre-monitoring-app
   LOCATION: eastus2
   RESOURCE_GROUP: rg-sre-monitoring-dev
+  # Backend configuration - storage created automatically by pipeline
+  BACKEND_RESOURCE_GROUP: rg-terraform-state
+  BACKEND_STORAGE_ACCOUNT: tfstatesremonitoring
+  BACKEND_CONTAINER: tfstate
+  BACKEND_KEY: sre-monitoring-dev.tfstate
 
 jobs:
   terraform:
@@ -20,8 +25,10 @@ jobs:
     
     outputs:
       acr_login_server: ${{ steps.tfout.outputs.acr }}
+      acr_name: ${{ steps.tfout.outputs.acr_name }}
       aks_cluster_name: ${{ steps.tfout.outputs.aks }}
       resource_group: ${{ steps.tfout.outputs.rg }}
+      backend_configured: ${{ steps.backend.outputs.configured }}
     
     steps:
       - name: Checkout Code
@@ -38,15 +45,80 @@ jobs:
           terraform_version: ${{ env.TF_VERSION }}
           terraform_wrapper: false
 
+      - name: Create Backend Storage (if not exists)
+        id: backend
+        run: |
+          echo "🔧 Setting up Terraform backend storage..."
+          
+          # Create resource group for state (idempotent)
+          az group create \
+            --name ${{ env.BACKEND_RESOURCE_GROUP }} \
+            --location ${{ env.LOCATION }} \
+            --tags environment=shared purpose=terraform-state \
+            || echo "Resource group already exists"
+          
+          # Check if storage account exists
+          if az storage account show --name ${{ env.BACKEND_STORAGE_ACCOUNT }} --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} &>/dev/null; then
+            echo "✅ Storage account already exists: ${{ env.BACKEND_STORAGE_ACCOUNT }}"
+          else
+            echo "📦 Creating storage account: ${{ env.BACKEND_STORAGE_ACCOUNT }}"
+            az storage account create \
+              --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
+              --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
+              --location ${{ env.LOCATION }} \
+              --sku Standard_LRS \
+              --encryption-services blob \
+              --https-only true \
+              --min-tls-version TLS1_2 \
+              --allow-blob-public-access false
+            echo "✅ Storage account created"
+          fi
+          
+          # Get storage account key
+          ACCOUNT_KEY=$(az storage account keys list \
+            --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
+            --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
+            --query '[0].value' -o tsv)
+          
+          # Create container for state files (idempotent)
+          az storage container create \
+            --name ${{ env.BACKEND_CONTAINER }} \
+            --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
+            --account-key ${ACCOUNT_KEY} \
+            --fail-on-exist false \
+            || echo "Container already exists"
+          
+          echo "configured=true" >> $GITHUB_OUTPUT
+          echo "storage_account=${{ env.BACKEND_STORAGE_ACCOUNT }}" >> $GITHUB_OUTPUT
+          echo "✅ Backend storage ready: ${{ env.BACKEND_STORAGE_ACCOUNT }}"
+
       - name: Terraform Format Check
         working-directory: terraform
         run: terraform fmt -check -recursive
         continue-on-error: true
 
-      - name: Terraform Init
+      - name: Terraform Init with Backend
         run: |
           cd terraform
-          terraform init -upgrade
+          
+          echo "🔧 Initializing Terraform with Azure backend..."
+          
+          # Get storage account key
+          ACCOUNT_KEY=$(az storage account keys list \
+            --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
+            --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
+            --query '[0].value' -o tsv)
+          
+          # Initialize with Azure backend
+          terraform init -upgrade \
+            -backend-config="resource_group_name=${{ env.BACKEND_RESOURCE_GROUP }}" \
+            -backend-config="storage_account_name=${{ env.BACKEND_STORAGE_ACCOUNT }}" \
+            -backend-config="container_name=${{ env.BACKEND_CONTAINER }}" \
+            -backend-config="key=${{ env.BACKEND_KEY }}" \
+            -backend-config="access_key=${ACCOUNT_KEY}"
+          
+          echo "✅ Terraform initialized with remote backend"
+          echo "📍 State location: ${{ env.BACKEND_STORAGE_ACCOUNT }}/${{ env.BACKEND_CONTAINER }}/${{ env.BACKEND_KEY }}"
 
       - name: Terraform Validate
         run: |
@@ -55,54 +127,43 @@ jobs:
 
       - name: Register Required Azure Resource Providers
         run: |
-          echo "Registering only the required Azure Resource Providers..."
+          echo "Registering required Azure Resource Providers..."
           
-          # Register only the providers we actually need for AKS and ACR
-          az provider register --namespace Microsoft.ContainerService
-          az provider register --namespace Microsoft.ContainerRegistry
-          az provider register --namespace Microsoft.Network
-          az provider register --namespace Microsoft.Compute
-          az provider register --namespace Microsoft.Storage
+          az provider register --namespace Microsoft.ContainerService --wait
+          az provider register --namespace Microsoft.ContainerRegistry --wait
+          az provider register --namespace Microsoft.Network --wait
+          az provider register --namespace Microsoft.Compute --wait
+          az provider register --namespace Microsoft.Storage --wait
           
-          echo "Waiting for provider registration to complete..."
-          az provider show --namespace Microsoft.ContainerService --query "registrationState" -o tsv
-          az provider show --namespace Microsoft.ContainerRegistry --query "registrationState" -o tsv
-          
-          echo "Required resource providers registered successfully"
+          echo "✅ All required resource providers registered"
 
       - name: Get Available Kubernetes Versions
         run: |
           echo "Getting available Kubernetes versions for ${{ env.LOCATION }}..."
           az aks get-versions --location ${{ env.LOCATION }} --output table
-          echo ""
-          echo "Available non-preview versions:"
-          az aks get-versions --location ${{ env.LOCATION }} --query "values[?isPreview==null].version" -o tsv
 
       - name: Terraform Plan
+        id: plan
         run: |
           cd terraform
           
-          # Get all available non-preview versions
-          echo "Fetching available Kubernetes versions..."
+          # Get available Kubernetes versions
           VERSIONS=$(az aks get-versions --location ${{ env.LOCATION }} --query "values[?isPreview==null].version" -o tsv)
           echo "Available versions: $VERSIONS"
           
-          # Try 1.31 first (most likely to be non-LTS)
+          # Select version (prefer 1.31, then 1.30, then latest)
           if echo "$VERSIONS" | grep -q "^1\.31"; then
             K8S_VERSION="1.31"
-          # Fallback to 1.32 if available
-          elif echo "$VERSIONS" | grep -q "^1\.32"; then
-            K8S_VERSION="1.32"
-          # Fallback to any version that starts with 1.3
-          elif echo "$VERSIONS" | grep -q "^1\.3"; then
-            K8S_VERSION=$(echo "$VERSIONS" | grep "^1\.3" | head -n1 | cut -d'.' -f1,2)
-          # Use first available version as last resort
+          elif echo "$VERSIONS" | grep -q "^1\.30"; then
+            K8S_VERSION="1.30"
           else
             K8S_VERSION=$(echo "$VERSIONS" | head -n1 | cut -d'.' -f1,2)
           fi
           
           echo "Selected Kubernetes version: $K8S_VERSION"
+          echo "k8s_version=${K8S_VERSION}" >> $GITHUB_OUTPUT
           
+          # Run plan
           terraform plan \
             -var="location=${{ env.LOCATION }}" \
             -var="environment=dev" \
@@ -112,28 +173,90 @@ jobs:
             -var="aks_cluster_name=aks-sre-monitoring-dev" \
             -var="aks_dns_prefix=aks-sre-dev" \
             -var="kubernetes_version=$K8S_VERSION" \
-            -out=tfplan
+            -out=tfplan \
+            -detailed-exitcode || PLAN_EXIT=$?
+          
+          # Capture plan status (0=no changes, 1=error, 2=changes)
+          if [ "${PLAN_EXIT:-0}" -eq 2 ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "✅ Plan created - changes detected"
+          elif [ "${PLAN_EXIT:-0}" -eq 0 ]; then
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ Plan created - no changes needed"
+          else
+            echo "❌ Plan failed with exit code ${PLAN_EXIT}"
+            exit 1
+          fi
 
       - name: Terraform Apply
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'workflow_dispatch')
         run: |
           cd terraform
+          
+          echo "🚀 Applying Terraform changes..."
           terraform apply -auto-approve tfplan
+          
+          echo "✅ Infrastructure provisioned successfully"
+
+      - name: Verify Infrastructure Created
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'workflow_dispatch')
+        run: |
+          echo "Verifying infrastructure creation..."
+          
+          # Check resource group
+          if az group show --name ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            echo "✅ Resource group exists: ${{ env.RESOURCE_GROUP }}"
+          else
+            echo "❌ Resource group not found!"
+            exit 1
+          fi
+          
+          # Check ACR
+          if az acr show --name acrsremonitoringdev --resource-group ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            echo "✅ ACR exists: acrsremonitoringdev"
+          else
+            echo "❌ ACR not found!"
+            exit 1
+          fi
+          
+          # Check AKS
+          if az aks show --name aks-sre-monitoring-dev --resource-group ${{ env.RESOURCE_GROUP }} &>/dev/null; then
+            echo "✅ AKS cluster exists: aks-sre-monitoring-dev"
+          else
+            echo "❌ AKS cluster not found!"
+            exit 1
+          fi
+          
+          echo "✅ All infrastructure verified successfully"
 
       - name: Export Terraform Outputs
         id: tfout
-        if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+        if: |
+          (github.event_name == 'push' && github.ref == 'refs/heads/main') ||
+          (github.event_name == 'workflow_dispatch')
         run: |
           cd terraform
           echo "acr=$(terraform output -raw acr_login_server)" >> $GITHUB_OUTPUT
+          echo "acr_name=$(terraform output -raw acr_name)" >> $GITHUB_OUTPUT
           echo "aks=$(terraform output -raw aks_cluster_name)" >> $GITHUB_OUTPUT
           echo "rg=$(terraform output -raw resource_group_name)" >> $GITHUB_OUTPUT
+          
+          echo "📋 Infrastructure Outputs:"
+          echo "  ACR: $(terraform output -raw acr_login_server)"
+          echo "  AKS: $(terraform output -raw aks_cluster_name)"
+          echo "  RG: $(terraform output -raw resource_group_name)"
 
   build-and-push:
     name: Build & Push Docker Image
     needs: terraform
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      github.event_name == 'workflow_dispatch'
     
     steps:
       - name: Checkout Code
@@ -145,31 +268,43 @@ jobs:
           creds: ${{ secrets.AZURE_CREDENTIALS }}
 
       - name: Login to Azure Container Registry
-        run: az acr login --name ${{ needs.terraform.outputs.acr_login_server }}
+        run: |
+          # Use ACR name, not login server
+          az acr login --name ${{ needs.terraform.outputs.acr_name }}
+          echo "✅ Logged into ACR: ${{ needs.terraform.outputs.acr_name }}"
 
       - name: Build Docker Image
         working-directory: app
         run: |
+          echo "🔨 Building Docker image..."
           docker build \
             -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
             -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest \
             .
+          echo "✅ Image built successfully"
 
       - name: Push Docker Image
         run: |
+          echo "📤 Pushing images to ACR..."
           docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
           docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest
+          echo "✅ Images pushed successfully"
 
-      - name: Scan Image for Vulnerabilities
+      - name: Verify Image in ACR
         run: |
-          az acr check-health --name ${{ needs.terraform.outputs.acr_login_server }} --yes
-        continue-on-error: true
+          az acr repository show \
+            --name ${{ needs.terraform.outputs.acr_name }} \
+            --repository ${{ env.IMAGE_NAME }} \
+            --query "name"
+          echo "✅ Image verified in ACR"
 
   deploy-app:
     name: Deploy Application to AKS
     needs: [terraform, build-and-push]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      github.event_name == 'workflow_dispatch'
     
     steps:
       - name: Checkout Code
@@ -186,6 +321,10 @@ jobs:
             --resource-group ${{ needs.terraform.outputs.resource_group }} \
             --name ${{ needs.terraform.outputs.aks_cluster_name }} \
             --overwrite-existing
+          
+          # Verify connection
+          kubectl cluster-info
+          echo "✅ Connected to AKS cluster"
 
       - name: Create App Namespace
         run: kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
@@ -199,22 +338,27 @@ jobs:
           kubectl apply -f k8s/app/deployment.yaml -n app
           kubectl apply -f k8s/app/service.yaml -n app
           kubectl apply -f k8s/app/hpa.yaml -n app
+          echo "✅ Application manifests applied"
 
       - name: Wait for Rollout
         run: |
           kubectl rollout status deployment/sre-app -n app --timeout=5m
+          echo "✅ Deployment rolled out successfully"
 
       - name: Verify Deployment
         run: |
+          echo "📋 Deployment Status:"
           kubectl get pods -n app
           kubectl get svc -n app
-          echo "Application deployed successfully!"
+          echo "✅ Application deployed successfully"
 
   deploy-monitoring:
     name: Deploy Monitoring Stack
     needs: [terraform, deploy-app]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      github.event_name == 'workflow_dispatch'
     
     steps:
       - name: Checkout Code
@@ -237,6 +381,7 @@ jobs:
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo add grafana https://grafana.github.io/helm-charts
           helm repo update
+          echo "✅ Helm repositories added"
 
       - name: Create Monitoring Namespace
         run: kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
@@ -250,16 +395,20 @@ jobs:
             --set grafana.adminPassword=admin123 \
             --timeout 10m \
             --wait
+          echo "✅ Monitoring stack deployed"
 
       - name: Verify Monitoring Stack
         run: |
+          echo "📋 Monitoring Status:"
           kubectl get pods -n monitoring
           kubectl get svc -n monitoring
-          echo "Monitoring stack deployed successfully!"
+          echo "✅ Monitoring stack verified"
 
       - name: Get Grafana Admin Password
         run: |
-          echo "Grafana admin password:"
+          echo "🔐 Grafana Credentials:"
+          echo "  Username: admin"
+          echo -n "  Password: "
           kubectl get secret --namespace monitoring monitoring-grafana -o jsonpath="{.data.admin-password}" | base64 --decode
           echo ""
 
@@ -267,7 +416,9 @@ jobs:
     name: Smoke Tests
     needs: [deploy-app, deploy-monitoring]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    if: |
+      (github.ref == 'refs/heads/main' && github.event_name == 'push') ||
+      github.event_name == 'workflow_dispatch'
     
     steps:
       - name: Checkout Code
@@ -287,36 +438,42 @@ jobs:
 
       - name: Test Application Health
         run: |
+          echo "🧪 Testing application health endpoint..."
           kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n app -- \
             curl -f http://sre-app-service:3000/health || exit 1
+          echo "✅ Health check passed"
         timeout-minutes: 2
 
       - name: Test Metrics Endpoint
         run: |
+          echo "🧪 Testing metrics endpoint..."
           kubectl run curl-test --image=curlimages/curl:latest --rm -i --restart=Never -n app -- \
             curl -f http://sre-app-service:3000/metrics || exit 1
+          echo "✅ Metrics check passed"
         timeout-minutes: 2
 
       - name: Verify Prometheus
         run: |
           kubectl get pods -n monitoring -l app.kubernetes.io/name=prometheus
-          echo "Prometheus is running"
+          echo "✅ Prometheus is running"
 
       - name: Verify Grafana
         run: |
           kubectl get pods -n monitoring -l app.kubernetes.io/name=grafana
-          echo "Grafana is running"
+          echo "✅ Grafana is running"
 
       - name: Display Service Endpoints
         run: |
+          echo "📋 Service Endpoints:"
+          echo ""
           echo "=== Application Services ==="
           kubectl get svc -n app
           echo ""
           echo "=== Monitoring Services ==="
           kubectl get svc -n monitoring
           echo ""
-          echo "=== Get External IP (if LoadBalancer) ==="
-          kubectl get svc sre-app-service -n app -o jsonpath='{.status.loadBalancer.ingress[0].ip}'
+          echo "=== External IP (if LoadBalancer) ==="
+          kubectl get svc sre-app-service -n app -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "No external IP yet"
 
   notify:
     name: Notify Deployment Status
