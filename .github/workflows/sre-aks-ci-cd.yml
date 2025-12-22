@@ -218,17 +218,25 @@ jobs:
         run: |
           cd terraform
           
-          # Get available Kubernetes versions
+          # Get available Kubernetes versions (non-preview only)
+          echo "Fetching available Kubernetes versions..."
           VERSIONS=$(az aks get-versions --location ${{ env.LOCATION }} --query "values[?isPreview==null].version" -o tsv)
           echo "Available versions: $VERSIONS"
           
-          # Select version (prefer 1.31, then 1.30, then latest)
-          if echo "$VERSIONS" | grep -q "^1\.31"; then
-            K8S_VERSION="1.31"
-          elif echo "$VERSIONS" | grep -q "^1\.30"; then
+          # Select version - prefer 1.30, avoid 1.31 (LTS-only), fallback to latest stable
+          if echo "$VERSIONS" | grep -q "^1\.30"; then
             K8S_VERSION="1.30"
+            echo "✅ Selected Kubernetes version 1.30 (stable, non-LTS)"
+          elif echo "$VERSIONS" | grep -q "^1\.29"; then
+            K8S_VERSION="1.29"
+            echo "✅ Selected Kubernetes version 1.29 (stable, non-LTS)"
+          elif echo "$VERSIONS" | grep -q "^1\.28"; then
+            K8S_VERSION="1.28"
+            echo "✅ Selected Kubernetes version 1.28 (stable, non-LTS)"
           else
-            K8S_VERSION=$(echo "$VERSIONS" | head -n1 | cut -d'.' -f1,2)
+            # Fallback: get the latest non-1.31 version
+            K8S_VERSION=$(echo "$VERSIONS" | grep -v "^1\.31" | sort -V | tail -n1 | cut -d'.' -f1,2)
+            echo "⚠️ Using fallback version: $K8S_VERSION"
           fi
           
           echo "Selected Kubernetes version: $K8S_VERSION"
