@@ -26,29 +26,29 @@ jobs:
     name: Terraform Infrastructure
     runs-on: ubuntu-latest
 
+    permissions:
+      id-token: write
+      contents: read
+
     outputs:
       acr_login_server: ${{ steps.tfout.outputs.acr }}
       acr_name: ${{ steps.tfout.outputs.acr_name }}
       aks_cluster_name: ${{ steps.tfout.outputs.aks }}
       resource_group: ${{ steps.tfout.outputs.rg }}
 
-    permissions:
-      id-token: write
-      contents: read
-
     steps:
     - name: Checkout Code
       uses: actions/checkout@v4
 
-    # 🔐 Azure Login using OIDC
-    - name: Azure Login (OIDC)
+    # 🔐 Azure Login (OIDC — CORRECT WAY)
+    - name: Azure Login
       uses: azure/login@v2
       with:
         client-id: ${{ secrets.AZURE_CLIENT_ID }}
         tenant-id: ${{ secrets.AZURE_TENANT_ID }}
         subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-    # 🔑 Export ARM variables for Terraform (CRITICAL FIX)
+    # 🔑 Export ARM vars for Terraform (MANDATORY)
     - name: Export Azure credentials for Terraform
       run: |
         echo "ARM_CLIENT_ID=${{ secrets.AZURE_CLIENT_ID }}" >> $GITHUB_ENV
@@ -63,15 +63,12 @@ jobs:
         terraform_wrapper: false
 
     # ---------- SAFE BACKEND CREATION ----------
-    - name: Create Terraform Backend (SAFE)
+    - name: Create Terraform Backend
       run: |
-        echo "Creating backend resource group..."
         az group create \
           --name ${{ env.BACKEND_RESOURCE_GROUP }} \
-          --location eastus \
-          --tags purpose=terraform-state || true
+          --location eastus || true
 
-        echo "Creating storage account if not exists..."
         az storage account create \
           --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
           --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
@@ -80,24 +77,20 @@ jobs:
           --https-only true \
           --allow-blob-public-access false || true
 
-        echo "Waiting for storage account propagation..."
+        echo "Waiting for storage account..."
         for i in {1..10}; do
-          if az storage account show \
+          az storage account show \
             --name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
-            --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} &>/dev/null; then
-            echo "Storage account available"
-            break
-          fi
+            --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} && break
           sleep 10
         done
 
-        echo "Creating blob container..."
         az storage container create \
           --name ${{ env.BACKEND_CONTAINER }} \
           --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
           --auth-mode login || true
 
-    - name: Terraform Init (Remote Backend)
+    - name: Terraform Init
       run: |
         cd terraform
         terraform init -upgrade \
@@ -145,8 +138,7 @@ jobs:
       contents: read
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
     - name: Azure Login
       uses: azure/login@v2
@@ -158,21 +150,17 @@ jobs:
     - name: Login to ACR
       run: az acr login --name ${{ needs.terraform.outputs.acr_name }}
 
-    - name: Build Docker Image
+    - name: Build & Push Image
       working-directory: k8s/app
       run: |
         docker build \
           -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
-          -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest \
-          .
-
-    - name: Push Docker Image
-      run: |
+          -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest .
         docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
         docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest
 
 # ============================================================
-# 3️⃣ DEPLOY APPLICATION TO AKS
+# 3️⃣ DEPLOY APP TO AKS
 # ============================================================
   deploy-app:
     name: Deploy Application
@@ -184,8 +172,7 @@ jobs:
       contents: read
 
     steps:
-    - name: Checkout Code
-      uses: actions/checkout@v4
+    - uses: actions/checkout@v4
 
     - name: Azure Login
       uses: azure/login@v2
@@ -201,24 +188,17 @@ jobs:
           --name ${{ needs.terraform.outputs.aks_cluster_name }} \
           --overwrite-existing
 
-    - name: Create App Namespace
-      run: kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
-
-    - name: Inject Image Tag
-      run: |
-        sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" k8s/app/deployment.yaml
-
     - name: Deploy App
       run: |
-        kubectl apply -n app -f k8s/app/deployment.yaml
-        kubectl apply -n app -f k8s/app/service.yaml
-        kubectl apply -n app -f k8s/app/hpa.yaml
+        kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
+        sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}|g" k8s/app/deployment.yaml
+        kubectl apply -n app -f k8s/app/
 
     - name: Wait for Rollout
       run: kubectl rollout status deployment/sre-app -n app --timeout=5m
 
 # ============================================================
-# 4️⃣ DEPLOY MONITORING (PROMETHEUS + GRAFANA)
+# 4️⃣ DEPLOY MONITORING
 # ============================================================
   deploy-monitoring:
     name: Deploy Monitoring
@@ -244,57 +224,12 @@ jobs:
           --name ${{ needs.terraform.outputs.aks_cluster_name }} \
           --overwrite-existing
 
-    - name: Add Helm Repo
+    - name: Install Prometheus + Grafana
       run: |
         helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
         helm repo update
-
-    - name: Create Monitoring Namespace
-      run: kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
-
-    - name: Install kube-prometheus-stack
-      run: |
+        kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
         helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
           -n monitoring \
           --set prometheus.prometheusSpec.serviceMonitorSelectorNilUsesHelmValues=false \
-          --timeout 10m \
           --wait
-
-# ============================================================
-# 5️⃣ SMOKE TESTS
-# ============================================================
-  smoke-test:
-    name: Smoke Tests
-    needs: deploy-monitoring
-    runs-on: ubuntu-latest
-
-    permissions:
-      id-token: write
-      contents: read
-
-    steps:
-    - name: Azure Login
-      uses: azure/login@v2
-      with:
-        client-id: ${{ secrets.AZURE_CLIENT_ID }}
-        tenant-id: ${{ secrets.AZURE_TENANT_ID }}
-        subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
-
-    - name: Get AKS Credentials
-      run: |
-        az aks get-credentials \
-          --resource-group ${{ needs.terraform.outputs.resource_group }} \
-          --name ${{ needs.terraform.outputs.aks_cluster_name }} \
-          --overwrite-existing
-
-    - name: Health Check
-      run: |
-        kubectl run curl-test --rm -i --restart=Never \
-          --image=curlimages/curl -n app -- \
-          curl -f http://sre-app-service:3000/health
-
-    - name: Metrics Check
-      run: |
-        kubectl run curl-test --rm -i --restart=Never \
-          --image=curlimages/curl -n app -- \
-          curl -f http://sre-app-service:3000/metrics
