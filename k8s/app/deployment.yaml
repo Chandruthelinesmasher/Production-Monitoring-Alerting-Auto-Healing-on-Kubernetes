@@ -4,8 +4,14 @@ metadata:
   name: sre-app
   labels:
     app: sre-app
+    version: v1
 spec:
   replicas: 2
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app: sre-app
@@ -13,6 +19,7 @@ spec:
     metadata:
       labels:
         app: sre-app
+        version: v1
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/path: "/metrics"
@@ -21,17 +28,43 @@ spec:
       containers:
       - name: sre-app
         image: IMAGE_PLACEHOLDER
+        imagePullPolicy: Always
         ports:
-        - containerPort: 3000
+        - name: http
+          containerPort: 3000
+          protocol: TCP
+        env:
+        - name: PORT
+          value: "3000"
+        - name: NODE_ENV
+          value: "production"
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
         readinessProbe:
           httpGet:
             path: /health
             port: 3000
           initialDelaySeconds: 5
           periodSeconds: 10
+          timeoutSeconds: 3
+          failureThreshold: 3
         livenessProbe:
           httpGet:
             path: /health
             port: 3000
           initialDelaySeconds: 15
           periodSeconds: 20
+          timeoutSeconds: 3
+          failureThreshold: 3
+        securityContext:
+          runAsNonRoot: true
+          runAsUser: 1001
+          allowPrivilegeEscalation: false
+          capabilities:
+            drop:
+            - ALL

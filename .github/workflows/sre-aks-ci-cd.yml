@@ -183,15 +183,29 @@ jobs:
       - name: Login to ACR
         run: az acr login --name ${{ needs.terraform.outputs.acr_name }}
 
-      - name: Build Image
-        working-directory: app
+      - name: Verify app directory exists
         run: |
-          docker build \
-            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest .
+          if [ ! -d "app" ]; then
+            echo "Error: app directory not found!"
+            echo "Repository structure:"
+            ls -la
+            exit 1
+          fi
+          echo "App directory contents:"
+          ls -la app/
 
-      - name: Push Image
+      - name: Build Image
+        run: |
+          cd app
+          docker build \
+            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest \
+            -t ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }} \
+            .
+
+      - name: Push Images
         run: |
           docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest
+          docker push ${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
 
 # ==========================================================
 # DEPLOY APP + MONITORING
@@ -234,3 +248,21 @@ jobs:
             -n monitoring \
             --set grafana.adminPassword=admin123 \
             --wait
+
+      - name: Verify Deployment
+        run: |
+          echo "Waiting for pods to be ready..."
+          kubectl wait --for=condition=ready pod -l app=sre-app -n app --timeout=300s || true
+          
+          echo "=== Application Pods ==="
+          kubectl get pods -n app
+          
+          echo "=== Monitoring Pods ==="
+          kubectl get pods -n monitoring
+          
+          echo "=== Services ==="
+          kubectl get svc -n app
+          kubectl get svc -n monitoring
+          
+          echo "=== Get LoadBalancer IP ==="
+          kubectl get svc sre-app-service -n app
