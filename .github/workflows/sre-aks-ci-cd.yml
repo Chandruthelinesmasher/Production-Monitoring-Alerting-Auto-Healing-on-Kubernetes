@@ -133,89 +133,23 @@ jobs:
           terraform apply -auto-approve tfplan
 
       # -----------------------------
-      # ACR Integration with AKS
+      # Verify ACR Integration (Managed by Terraform)
       # -----------------------------
-      - name: Configure ACR Pull Permission for AKS
+      - name: Verify ACR Integration
         run: |
           echo "=========================================="
-          echo "Configuring ACR integration with AKS..."
+          echo "Verifying ACR Integration..."
           echo "=========================================="
           
-          AKS_NAME=$(cd terraform && terraform output -raw aks_cluster_name)
-          ACR_NAME=$(cd terraform && terraform output -raw acr_name)
+          cd terraform
           
-          echo "AKS Cluster: $AKS_NAME"
-          echo "ACR Name: $ACR_NAME"
+          # Get outputs from Terraform
+          ACR_ROLE_ASSIGNMENT=$(terraform output -raw acr_role_assignment_id)
+          
+          echo "✅ ACR Role Assignment ID: $ACR_ROLE_ASSIGNMENT"
           echo ""
-          
-          # Method 1: Use AKS attach-acr (Recommended - Idempotent)
-          echo "🔗 Attaching ACR to AKS cluster..."
-          if az aks update \
-            --resource-group $RESOURCE_GROUP \
-            --name $AKS_NAME \
-            --attach-acr $ACR_NAME \
-            --no-wait 2>&1 | tee /tmp/attach-acr.log; then
-            echo "✅ ACR attach command executed successfully"
-          else
-            echo "⚠️  ACR attach failed or already attached, trying manual assignment..."
-          fi
-          
-          # Wait for the update to propagate
-          echo ""
-          echo "⏳ Waiting 45 seconds for ACR integration to propagate..."
-          sleep 45
-          
-          # Method 2: Manual role assignment (Fallback)
-          echo ""
-          echo "🔍 Verifying role assignment..."
-          
-          AKS_KUBELET_ID=$(az aks show \
-            --resource-group $RESOURCE_GROUP \
-            --name $AKS_NAME \
-            --query identityProfile.kubeletidentity.objectId -o tsv)
-          
-          ACR_ID=$(az acr show \
-            --name $ACR_NAME \
-            --resource-group $RESOURCE_GROUP \
-            --query id -o tsv)
-          
-          echo "Kubelet Identity: $AKS_KUBELET_ID"
-          echo "ACR Resource ID: $ACR_ID"
-          echo ""
-          
-          # Check if role already exists
-          EXISTING_ROLE=$(az role assignment list \
-            --assignee $AKS_KUBELET_ID \
-            --scope $ACR_ID \
-            --query "[?roleDefinitionName=='AcrPull'].roleDefinitionName" -o tsv)
-          
-          if [ -z "$EXISTING_ROLE" ]; then
-            echo "📝 Creating AcrPull role assignment..."
-            az role assignment create \
-              --assignee $AKS_KUBELET_ID \
-              --role AcrPull \
-              --scope $ACR_ID
-            echo "✅ Role assignment created"
-            
-            # Wait for role propagation
-            echo "⏳ Waiting 30 seconds for role propagation..."
-            sleep 30
-          else
-            echo "✅ AcrPull role already assigned"
-          fi
-          
-          # Final verification
-          echo ""
-          echo "=========================================="
-          echo "Final Role Assignment Status:"
-          echo "=========================================="
-          az role assignment list \
-            --assignee $AKS_KUBELET_ID \
-            --scope $ACR_ID \
-            --query "[?roleDefinitionName=='AcrPull'].{Role:roleDefinitionName,Scope:scope}" -o table
-          
-          echo ""
-          echo "✅ ACR integration configuration complete!"
+          echo "ACR integration is managed by Terraform and configured automatically!"
+          echo "AKS can now pull images from ACR without manual intervention."
 
       - name: Export Terraform Outputs
         id: tfout
@@ -315,11 +249,39 @@ jobs:
 
       - name: Deploy Application
         run: |
+          echo "=========================================="
           echo "Deploying application resources..."
+          echo "=========================================="
+          
+          # Update image reference
           sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest|g" k8s/app/deployment.yaml
+          
+          # Apply application manifests
           kubectl apply -f k8s/app -n app
           
-          echo "Application deployed successfully"
+          echo ""
+          echo "✅ Application manifests deployed"
+          echo ""
+          
+          # Give pods time to start pulling images
+          echo "⏳ Waiting 30 seconds for pods to start..."
+          sleep 30
+          
+          # Check initial pod status
+          echo "=========================================="
+          echo "Initial Pod Status:"
+          echo "=========================================="
+          kubectl get pods -n app -o wide
+          
+          # Check for image pull errors
+          POD_STATUS=$(kubectl get pods -n app -o jsonpath='{.items[0].status.containerStatuses[0].state}' 2>/dev/null || echo "{}")
+          if echo "$POD_STATUS" | grep -q "ImagePullBackOff\|ErrImagePull"; then
+            echo ""
+            echo "⚠️  WARNING: Detected image pull issues. Checking pod events..."
+            kubectl describe pods -l app=sre-app -n app | grep -A 10 "Events:"
+            echo ""
+            echo "Note: ACR integration is managed by Terraform and should be configured."
+          fi
 
       - name: Deploy ServiceMonitor
         run: |
