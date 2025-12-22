@@ -51,13 +51,15 @@ jobs:
           echo "🔧 Setting up Terraform backend storage..."
           
           # Create resource group for state (idempotent)
+          echo "Creating resource group: ${{ env.BACKEND_RESOURCE_GROUP }}"
           az group create \
             --name ${{ env.BACKEND_RESOURCE_GROUP }} \
             --location ${{ env.LOCATION }} \
             --tags environment=shared purpose=terraform-state \
-            || echo "Resource group already exists"
+            || true
           
           # Check if storage account exists
+          echo "Checking storage account: ${{ env.BACKEND_STORAGE_ACCOUNT }}"
           if az storage account show --name ${{ env.BACKEND_STORAGE_ACCOUNT }} --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} &>/dev/null; then
             echo "✅ Storage account already exists: ${{ env.BACKEND_STORAGE_ACCOUNT }}"
           else
@@ -71,26 +73,69 @@ jobs:
               --https-only true \
               --min-tls-version TLS1_2 \
               --allow-blob-public-access false
+            
+            # Wait for storage account to be ready
+            echo "Waiting for storage account to be ready..."
+            sleep 10
             echo "✅ Storage account created"
           fi
           
           # Get storage account key
+          echo "Retrieving storage account key..."
           ACCOUNT_KEY=$(az storage account keys list \
             --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
             --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
             --query '[0].value' -o tsv)
           
-          # Create container for state files (idempotent)
-          az storage container create \
+          if [ -z "$ACCOUNT_KEY" ]; then
+            echo "❌ Failed to retrieve storage account key"
+            exit 1
+          fi
+          
+          echo "✅ Storage account key retrieved"
+          
+          # Check if container exists
+          echo "Checking container: ${{ env.BACKEND_CONTAINER }}"
+          CONTAINER_EXISTS=$(az storage container exists \
             --name ${{ env.BACKEND_CONTAINER }} \
             --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
             --account-key ${ACCOUNT_KEY} \
-            --fail-on-exist false \
-            || echo "Container already exists"
+            --query exists -o tsv)
+          
+          if [ "$CONTAINER_EXISTS" = "true" ]; then
+            echo "✅ Container already exists: ${{ env.BACKEND_CONTAINER }}"
+          else
+            echo "📦 Creating container: ${{ env.BACKEND_CONTAINER }}"
+            az storage container create \
+              --name ${{ env.BACKEND_CONTAINER }} \
+              --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
+              --account-key ${ACCOUNT_KEY} \
+              --auth-mode key
+            
+            # Verify container was created
+            sleep 5
+            VERIFY=$(az storage container exists \
+              --name ${{ env.BACKEND_CONTAINER }} \
+              --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
+              --account-key ${ACCOUNT_KEY} \
+              --query exists -o tsv)
+            
+            if [ "$VERIFY" = "true" ]; then
+              echo "✅ Container created successfully"
+            else
+              echo "❌ Failed to create container"
+              exit 1
+            fi
+          fi
           
           echo "configured=true" >> $GITHUB_OUTPUT
           echo "storage_account=${{ env.BACKEND_STORAGE_ACCOUNT }}" >> $GITHUB_OUTPUT
-          echo "✅ Backend storage ready: ${{ env.BACKEND_STORAGE_ACCOUNT }}"
+          
+          echo ""
+          echo "✅ Backend storage ready!"
+          echo "   Resource Group: ${{ env.BACKEND_RESOURCE_GROUP }}"
+          echo "   Storage Account: ${{ env.BACKEND_STORAGE_ACCOUNT }}"
+          echo "   Container: ${{ env.BACKEND_CONTAINER }}"
 
       - name: Terraform Format Check
         working-directory: terraform
@@ -108,6 +153,32 @@ jobs:
             --resource-group ${{ env.BACKEND_RESOURCE_GROUP }} \
             --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
             --query '[0].value' -o tsv)
+          
+          if [ -z "$ACCOUNT_KEY" ]; then
+            echo "❌ Failed to retrieve storage account key"
+            exit 1
+          fi
+          
+          # Verify container exists before init
+          echo "Verifying backend container exists..."
+          CONTAINER_EXISTS=$(az storage container exists \
+            --name ${{ env.BACKEND_CONTAINER }} \
+            --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
+            --account-key ${ACCOUNT_KEY} \
+            --query exists -o tsv)
+          
+          if [ "$CONTAINER_EXISTS" != "true" ]; then
+            echo "❌ Container ${{ env.BACKEND_CONTAINER }} does not exist!"
+            echo "Creating container now..."
+            az storage container create \
+              --name ${{ env.BACKEND_CONTAINER }} \
+              --account-name ${{ env.BACKEND_STORAGE_ACCOUNT }} \
+              --account-key ${ACCOUNT_KEY} \
+              --auth-mode key
+            sleep 5
+          fi
+          
+          echo "✅ Backend container verified"
           
           # Initialize with Azure backend
           terraform init -upgrade \
