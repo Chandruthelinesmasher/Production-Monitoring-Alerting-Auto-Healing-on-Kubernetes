@@ -1,16 +1,16 @@
-apiVersion: monitoring.coreos.com/v1
-kind: ServiceMonitor
+apiVersion: v1
+kind: Service
 metadata:
-  name: sre-app-monitor
+  name: sre-app-service
+  namespace: app
   labels:
     app: sre-app
-    release: monitoring
 spec:
+  type: LoadBalancer
   selector:
-    matchLabels:
-      app: sre-app
-  endpoints:
-  - port: http
-    path: /metrics
-    interval: 30s
-    scrapeTimeout: 10s
+    app: sre-app
+  ports:
+    - port: 80
+      targetPort: 3000
+      protocol: TCP
+      name: http  # This name must match the ServiceMonitor port name

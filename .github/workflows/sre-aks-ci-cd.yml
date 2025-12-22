@@ -235,34 +235,94 @@ jobs:
           kubectl create namespace app --dry-run=client -o yaml | kubectl apply -f -
           kubectl create namespace monitoring --dry-run=client -o yaml | kubectl apply -f -
 
-      - name: Deploy Application
+      - name: Deploy Monitoring Stack (First)
         run: |
-          sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest|g" k8s/app/deployment.yaml
-          kubectl apply -f k8s/app -n app
-
-      - name: Deploy Monitoring Stack
-        run: |
+          echo "Installing Prometheus Operator and monitoring stack..."
           helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
           helm repo update
+          
           helm upgrade --install monitoring prometheus-community/kube-prometheus-stack \
             -n monitoring \
             --set grafana.adminPassword=admin123 \
-            --wait
+            --wait \
+            --timeout 10m
+          
+          echo "Waiting for Prometheus Operator CRDs to be ready..."
+          kubectl wait --for condition=established --timeout=300s \
+            crd/servicemonitors.monitoring.coreos.com || echo "ServiceMonitor CRD check timed out"
+
+      - name: Deploy Application
+        run: |
+          echo "Deploying application resources..."
+          sed -i "s|IMAGE_PLACEHOLDER|${{ needs.terraform.outputs.acr_login_server }}/${{ env.IMAGE_NAME }}:latest|g" k8s/app/deployment.yaml
+          kubectl apply -f k8s/app -n app
+          
+          echo "Application deployed successfully"
+
+      - name: Deploy ServiceMonitor
+        run: |
+          echo "Deploying ServiceMonitor for metrics scraping..."
+          
+          # Check if ServiceMonitor CRD exists
+          if kubectl get crd servicemonitors.monitoring.coreos.com &>/dev/null; then
+            kubectl apply -f k8s/monitoring/servicemonitor.yaml
+            echo "✅ ServiceMonitor deployed successfully"
+          else
+            echo "⚠️  ServiceMonitor CRD not found. Skipping ServiceMonitor deployment."
+            echo "This usually means Prometheus Operator is not fully installed yet."
+          fi
 
       - name: Verify Deployment
         run: |
           echo "Waiting for pods to be ready..."
           kubectl wait --for=condition=ready pod -l app=sre-app -n app --timeout=300s || true
           
-          echo "=== Application Pods ==="
-          kubectl get pods -n app
+          echo ""
+          echo "=========================================="
+          echo "=== APPLICATION PODS ==="
+          echo "=========================================="
+          kubectl get pods -n app -o wide
           
-          echo "=== Monitoring Pods ==="
+          echo ""
+          echo "=========================================="
+          echo "=== MONITORING PODS ==="
+          echo "=========================================="
           kubectl get pods -n monitoring
           
-          echo "=== Services ==="
+          echo ""
+          echo "=========================================="
+          echo "=== APPLICATION SERVICES ==="
+          echo "=========================================="
           kubectl get svc -n app
+          
+          echo ""
+          echo "=========================================="
+          echo "=== MONITORING SERVICES ==="
+          echo "=========================================="
           kubectl get svc -n monitoring
           
-          echo "=== Get LoadBalancer IP ==="
-          kubectl get svc sre-app-service -n app
+          echo ""
+          echo "=========================================="
+          echo "=== SERVICEMONITOR STATUS ==="
+          echo "=========================================="
+          kubectl get servicemonitor -n app || echo "No ServiceMonitors found"
+          
+          echo ""
+          echo "=========================================="
+          echo "=== APPLICATION LOAD BALANCER IP ==="
+          echo "=========================================="
+          kubectl get svc sre-app-service -n app -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "LoadBalancer IP not yet assigned"
+          
+          echo ""
+          echo "=========================================="
+          echo "=== GRAFANA ACCESS ==="
+          echo "=========================================="
+          echo "Grafana URL: http://$(kubectl get svc monitoring-grafana -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}'):80"
+          echo "Username: admin"
+          echo "Password: admin123"
+          
+          echo ""
+          echo "=========================================="
+          echo "=== PROMETHEUS ACCESS ==="
+          echo "=========================================="
+          echo "Prometheus URL: http://$(kubectl get svc monitoring-kube-prometheus-prometheus -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}'):9090"
