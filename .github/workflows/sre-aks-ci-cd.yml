@@ -133,27 +133,89 @@ jobs:
           terraform apply -auto-approve tfplan
 
       # -----------------------------
-      # Manual ACR Role Assignment (Workaround)
+      # ACR Integration with AKS
       # -----------------------------
       - name: Configure ACR Pull Permission for AKS
         run: |
-          # Get the AKS kubelet identity
+          echo "=========================================="
+          echo "Configuring ACR integration with AKS..."
+          echo "=========================================="
+          
+          AKS_NAME=$(cd terraform && terraform output -raw aks_cluster_name)
+          ACR_NAME=$(cd terraform && terraform output -raw acr_name)
+          
+          echo "AKS Cluster: $AKS_NAME"
+          echo "ACR Name: $ACR_NAME"
+          echo ""
+          
+          # Method 1: Use AKS attach-acr (Recommended - Idempotent)
+          echo "🔗 Attaching ACR to AKS cluster..."
+          if az aks update \
+            --resource-group $RESOURCE_GROUP \
+            --name $AKS_NAME \
+            --attach-acr $ACR_NAME \
+            --no-wait 2>&1 | tee /tmp/attach-acr.log; then
+            echo "✅ ACR attach command executed successfully"
+          else
+            echo "⚠️  ACR attach failed or already attached, trying manual assignment..."
+          fi
+          
+          # Wait for the update to propagate
+          echo ""
+          echo "⏳ Waiting 45 seconds for ACR integration to propagate..."
+          sleep 45
+          
+          # Method 2: Manual role assignment (Fallback)
+          echo ""
+          echo "🔍 Verifying role assignment..."
+          
           AKS_KUBELET_ID=$(az aks show \
             --resource-group $RESOURCE_GROUP \
-            --name $(cd terraform && terraform output -raw aks_cluster_name) \
+            --name $AKS_NAME \
             --query identityProfile.kubeletidentity.objectId -o tsv)
           
-          # Get ACR resource ID
           ACR_ID=$(az acr show \
-            --name $(cd terraform && terraform output -raw acr_name) \
+            --name $ACR_NAME \
             --resource-group $RESOURCE_GROUP \
             --query id -o tsv)
           
-          # Assign AcrPull role (idempotent)
-          az role assignment create \
+          echo "Kubelet Identity: $AKS_KUBELET_ID"
+          echo "ACR Resource ID: $ACR_ID"
+          echo ""
+          
+          # Check if role already exists
+          EXISTING_ROLE=$(az role assignment list \
             --assignee $AKS_KUBELET_ID \
-            --role AcrPull \
-            --scope $ACR_ID || echo "Role assignment already exists"
+            --scope $ACR_ID \
+            --query "[?roleDefinitionName=='AcrPull'].roleDefinitionName" -o tsv)
+          
+          if [ -z "$EXISTING_ROLE" ]; then
+            echo "📝 Creating AcrPull role assignment..."
+            az role assignment create \
+              --assignee $AKS_KUBELET_ID \
+              --role AcrPull \
+              --scope $ACR_ID
+            echo "✅ Role assignment created"
+            
+            # Wait for role propagation
+            echo "⏳ Waiting 30 seconds for role propagation..."
+            sleep 30
+          else
+            echo "✅ AcrPull role already assigned"
+          fi
+          
+          # Final verification
+          echo ""
+          echo "=========================================="
+          echo "Final Role Assignment Status:"
+          echo "=========================================="
+          az role assignment list \
+            --assignee $AKS_KUBELET_ID \
+            --scope $ACR_ID \
+            --query "[?roleDefinitionName=='AcrPull'].{Role:roleDefinitionName,Scope:scope}" -o table
+          
+          echo ""
+          echo "✅ ACR integration configuration complete!"
 
       - name: Export Terraform Outputs
         id: tfout
@@ -275,7 +337,14 @@ jobs:
       - name: Verify Deployment
         run: |
           echo "Waiting for pods to be ready..."
-          kubectl wait --for=condition=ready pod -l app=sre-app -n app --timeout=300s || true
+          kubectl wait --for=condition=ready pod -l app=sre-app -n app --timeout=300s || {
+            echo "⚠️  Pods failed to become ready. Checking pod status..."
+            kubectl get pods -n app
+            echo ""
+            echo "Pod Events:"
+            kubectl describe pods -l app=sre-app -n app | grep -A 20 Events:
+            exit 1
+          }
           
           echo ""
           echo "=========================================="
@@ -311,18 +380,33 @@ jobs:
           echo "=========================================="
           echo "=== APPLICATION LOAD BALANCER IP ==="
           echo "=========================================="
-          kubectl get svc sre-app-service -n app -o jsonpath='{.status.loadBalancer.ingress[0].ip}' || echo "LoadBalancer IP not yet assigned"
+          APP_IP=$(kubectl get svc sre-app-service -n app -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+          if [ "$APP_IP" != "pending" ]; then
+            echo "Application URL: http://$APP_IP"
+          else
+            echo "LoadBalancer IP not yet assigned (this may take a few minutes)"
+          fi
           
           echo ""
           echo "=========================================="
           echo "=== GRAFANA ACCESS ==="
           echo "=========================================="
-          echo "Grafana URL: http://$(kubectl get svc monitoring-grafana -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}'):80"
-          echo "Username: admin"
-          echo "Password: admin123"
+          GRAFANA_IP=$(kubectl get svc monitoring-grafana -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+          if [ "$GRAFANA_IP" != "pending" ]; then
+            echo "Grafana URL: http://$GRAFANA_IP"
+            echo "Username: admin"
+            echo "Password: admin123"
+          else
+            echo "Grafana LoadBalancer IP pending..."
+          fi
           
           echo ""
           echo "=========================================="
           echo "=== PROMETHEUS ACCESS ==="
           echo "=========================================="
-          echo "Prometheus URL: http://$(kubectl get svc monitoring-kube-prometheus-prometheus -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}'):9090"
+          PROM_IP=$(kubectl get svc monitoring-kube-prometheus-prometheus -n monitoring -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo "pending")
+          if [ "$PROM_IP" != "pending" ]; then
+            echo "Prometheus URL: http://$PROM_IP:9090"
+          else
+            echo "Prometheus LoadBalancer IP pending..."
+          fi
