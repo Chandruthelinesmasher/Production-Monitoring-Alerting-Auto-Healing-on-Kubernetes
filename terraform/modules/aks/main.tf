@@ -3,7 +3,7 @@ resource "azurerm_kubernetes_cluster" "main" {
   location            = var.location
   resource_group_name = var.resource_group_name
   dns_prefix          = var.dns_prefix
-  kubernetes_version  = var.kubernetes_version
+  kubernetes_version  = var.kubernetes_version  # Will use Azure's default stable version if null
 
   default_node_pool {
     name       = var.default_node_pool.name

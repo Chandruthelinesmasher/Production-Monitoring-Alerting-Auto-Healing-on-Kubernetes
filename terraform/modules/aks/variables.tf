@@ -19,9 +19,9 @@ variable "dns_prefix" {
 }
 
 variable "kubernetes_version" {
-  description = "Kubernetes version"
+  description = "Kubernetes version (null = latest stable version)"
   type        = string
-  default     = "1.28"
+  default     = null
 }
 
 variable "default_node_pool" {
