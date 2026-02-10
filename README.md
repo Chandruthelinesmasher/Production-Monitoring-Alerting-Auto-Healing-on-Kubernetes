@@ -7,7 +7,7 @@ The focus is not just deploying applications — but **keeping them reliable und
 
 ---
 
-## 🎯 Key Objectives
+## Key Objectives
 - Provision AKS infrastructure using **Terraform**
 - Deploy containerized applications via **GitHub Actions CI/CD**
 - Implement **real-time monitoring** with Prometheus & Grafana
