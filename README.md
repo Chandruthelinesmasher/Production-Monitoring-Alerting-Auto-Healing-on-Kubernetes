@@ -1,6 +1,6 @@
 # Production Monitoring, Alerting & Auto-Healing on Kubernetes (SRE)
 
-## 📌 Overview
+## Overview
 This project demonstrates a **production-grade SRE monitoring, alerting, and auto-healing system** built on **Azure Kubernetes Service (AKS)** using **Infrastructure as Code, CI/CD automation, and cloud-native observability tools**.
 
 The focus is not just deploying applications — but **keeping them reliable under failure**.
@@ -17,7 +17,7 @@ The focus is not just deploying applications — but **keeping them reliable und
 
 ---
 
-## 🧠 High-Level Architecture
+## High-Level Architecture
 
 ![Architecture Diagram](docs/architecture.png)
 
@@ -37,7 +37,7 @@ The focus is not just deploying applications — but **keeping them reliable und
 
 ---
 
-## 🛠️ Technology Stack
+## Technology Stack
 
 ### Cloud & Infrastructure
 - **Microsoft Azure**
@@ -61,7 +61,7 @@ The focus is not just deploying applications — but **keeping them reliable und
 
 ---
 
-## 📂 Repository Structure
+## Repository Structure
 
 ```text
 .
